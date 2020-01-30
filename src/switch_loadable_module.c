@@ -2677,7 +2677,7 @@ static void switch_loadable_module_sort_codecs(const switch_codec_implementation
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "--BEFORE\n");
 #endif
 
-	for (i = 0; i < arraylen; i++) {
+	for (i = 0; i < arraylen && array[i]; i++) {
 		int this_ptime = array[i]->microseconds_per_packet / 1000;
 
 		if (!strcasecmp(array[i]->iananame, "ilbc")) {
