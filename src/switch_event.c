@@ -1114,7 +1114,9 @@ static switch_status_t switch_event_base_add_header(switch_event_t *event, switc
 	redraw:
 		len = 0;
 		for(j = 0; j < header->idx; j++) {
-			len += strlen(header->array[j]) + 2;
+			if (header->array[j]) {
+				len += strlen(header->array[j]) + 2;
+			}
 		}
 
 		if (len) {
