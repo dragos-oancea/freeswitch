@@ -2444,6 +2444,8 @@ SWITCH_DECLARE(switch_status_t) switch_xml_destroy(void)
 		MAIN_XML_ROOT = NULL;
 		switch_xml_free(xml);
 		status = SWITCH_STATUS_SUCCESS;
+	} else {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "WTF , no xml root?\n");
 	}
 
 	switch_mutex_unlock(XML_LOCK);
