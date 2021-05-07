@@ -369,6 +369,8 @@ typedef enum {
 #define SOFIA_MAX_MSG_QUEUE 64
 #define SOFIA_MSG_QUEUE_SIZE 1000
 
+#define SOFIA_MAX_REG_ALGS 7 /* rfc8760 */
+
 struct mod_sofia_globals {
 	switch_memory_pool_t *pool;
 	switch_hash_t *profile_hash;
@@ -405,6 +407,11 @@ struct mod_sofia_globals {
 	time_t presence_epoch;
 	int presence_year;
 	int abort_on_empty_external_ip;
+	const char *stir_shaken_as_key;
+	const char *stir_shaken_as_url;
+	const char *stir_shaken_vs_ca_dir;
+	int stir_shaken_vs_cert_path_check;
+	int stir_shaken_vs_require_date;
 };
 extern struct mod_sofia_globals mod_sofia_globals;
 
@@ -432,6 +439,7 @@ typedef enum {
 	REG_STATE_FAIL_WAIT,
 	REG_STATE_EXPIRED,
 	REG_STATE_NOREG,
+	REG_STATE_DOWN,
 	REG_STATE_TIMEOUT,
 	REG_STATE_LAST
 } reg_state_t;
@@ -597,6 +605,13 @@ typedef enum {
 	KA_MESSAGE,
 	KA_INFO
 } ka_type_t;
+
+typedef enum {
+	ALG_MD5 = (1 << 0),
+	ALG_SHA256 = (1 << 1),
+	ALG_SHA512 = (1 << 2),
+	ALG_NONE = (1 << 3),
+} sofia_auth_algs_t;
 
 struct sofia_profile {
 	int debug;
@@ -788,6 +803,8 @@ struct sofia_profile {
 	char *rfc7989_filter;
 	char *acl_inbound_x_token_header;
 	char *acl_proxy_x_token_header;
+	uint8_t rfc8760_algs_count;
+	sofia_auth_algs_t auth_algs[SOFIA_MAX_REG_ALGS];
 };
 
 
@@ -1236,7 +1253,7 @@ uint32_t sofia_presence_get_cseq(sofia_profile_t *profile);
 void sofia_glue_build_vid_refresh_message(switch_core_session_t *session, const char *pl);
 char *sofia_glue_gen_contact_str(sofia_profile_t *profile, sip_t const *sip, nua_handle_t *nh, sofia_dispatch_event_t *de, sofia_nat_parse_t *np);
 void sofia_glue_pause_jitterbuffer(switch_core_session_t *session, switch_bool_t on);
-void sofia_process_dispatch_event(sofia_dispatch_event_t **dep);
+void sofia_process_dispatch_event(sofia_dispatch_event_t **dep, switch_bool_t stack_thread);
 void sofia_process_dispatch_event_in_thread(sofia_dispatch_event_t **dep);
 char *sofia_glue_get_host(const char *str, switch_memory_pool_t *pool);
 void sofia_presence_check_subscriptions(sofia_profile_t *profile, time_t now);
@@ -1259,6 +1276,10 @@ void sofia_reg_close_handles(sofia_profile_t *profile);
 
 void write_csta_xml_chunk(switch_event_t *event, switch_stream_handle_t stream, const char *csta_event, char *fwd_type);
 void sofia_glue_clear_soa(switch_core_session_t *session, switch_bool_t partner);
+sofia_auth_algs_t sofia_alg_str2id(char *algorithm, switch_bool_t permissive);
+switch_status_t sofia_make_digest(sofia_auth_algs_t use_alg, char **digest, const void *input, unsigned int *outputlen);
+
+char *sofia_stir_shaken_as_create_identity_header(switch_core_session_t *session, const char *attest, const char *orig, const char *dest);
 
 /* For Emacs:
  * Local Variables:
