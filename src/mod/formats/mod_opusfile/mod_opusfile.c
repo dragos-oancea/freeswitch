@@ -126,7 +126,8 @@ struct opus_stream_context {
 	switch_file_handle_t *handle;
 	size_t samplerate;
 	int frame_size;
-	int dec_channels;
+	int dec_channels;   /* channels in the incoming ogg/opus stream */
+	int codec_channels; /* channels of the codec implementation (what FS expects) */
 	size_t err;
 	opus_int16 *opusbuf;
 	switch_size_t opusbuflen;
@@ -136,6 +137,7 @@ struct opus_stream_context {
 	unsigned char encode_buf[OPUSSTREAM_MAX];
 	int encoded_buflen;
 	size_t samples_encode;
+	size_t samples_since_page;
 	int enc_channels;
 	unsigned int enc_pagecount;
 #endif
@@ -150,58 +152,66 @@ static struct {
 	int debug;
 } globals;
 
+#ifdef HAVE_OPUSFILE_ENCODE
+/* opus_multistream_surround_encoder_get_size() in libopus will check these */
+static int opusfile_mapping_family(int channels)
+{
+	if (channels > 2 && channels <= 8) {
+		return 1;
+	} else if (channels > 8) {
+		/* multichannel/multistream mapping family. https://people.xiph.org/~giles/2013/draft-ietf-codec-oggopus.html#rfc.section.5.1.1 */
+		return 255;
+	}
+	return 0;
+}
+#endif
+
 static switch_status_t switch_opusfile_decode(opus_file_context *context, void *data, size_t max_bytes, int channels)
 {
 	int ret = 0;
-	size_t buf_inuse;
+	int out_channels = channels;
+	size_t buf_inuse = 0;
 
 	if (!context->of) {
 		return SWITCH_STATUS_FALSE;
 	}
-	
+
+	if (channels < 1 || channels > 255) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS File] Invalid number of channels [%d]\n", channels);
+		return SWITCH_STATUS_FALSE;
+	}
+
 	memset(context->decode_buf, 0, sizeof(context->decode_buf));
 	switch_mutex_lock(context->audio_mutex);
-	while (!(context->eof) && (buf_inuse = switch_buffer_inuse(context->audio_buffer)) <= max_bytes) {
+	while (!(context->eof) && (buf_inuse = switch_buffer_inuse(context->audio_buffer)) < max_bytes) {
+		int li = -1;
 
-		if (channels == 1) {
-			ret = op_read(context->of, (opus_int16 *)context->decode_buf, OPUS_MAX_PCM, NULL);
-		} else if (channels == 2) {
+		if (channels == 2) {
+			/* always returns interleaved stereo (downmixes/upmixes as needed) */
 			ret = op_read_stereo(context->of, (opus_int16 *)context->decode_buf, OPUS_MAX_PCM);
-		} else if (channels > 2) {
-			ret = op_read(context->of, (opus_int16 *)context->decode_buf, OPUS_MAX_PCM, NULL);
-		} else if ((channels > 255) || (channels < 1)) { 
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS File] Invalid number of channels");
-				switch_mutex_unlock(context->audio_mutex);
-				return SWITCH_STATUS_FALSE;
-		}
-		if (ret < 0) {
-			switch(ret) {
-			case OP_HOLE:	/* There was a hole in the data, and some samples may have been skipped. Call this function again to continue decoding past the hole.*/
-			case OP_EREAD:	/*An underlying read operation failed. This may signal a truncation attack from an <https:> source.*/
-			
-			case OP_EFAULT: /*	An internal memory allocation failed. */
-
-			case OP_EIMPL:	/*An unseekable stream encountered a new link that used a feature that is not implemented, such as an unsupported channel family.*/
-
-			case OP_EINVAL:	/* The stream was only partially open. */
-
-			case OP_ENOTFORMAT: /*	An unseekable stream encountered a new link that did not have any logical Opus streams in it. */
-
-			case OP_EBADHEADER:	/*An unseekable stream encountered a new link with a required header packet that was not properly formatted, contained illegal values, or was missing altogether.*/
-
-			case OP_EVERSION:	/*An unseekable stream encountered a new link with an ID header that contained an unrecognized version number.*/
-
-			case OP_EBADPACKET: /*Failed to properly decode the next packet.*/
-
-			case OP_EBADLINK:		/*We failed to find data we had seen before.*/
-
-			case OP_EBADTIMESTAMP:		/*An unseekable stream encountered a new link with a starting timestamp that failed basic validity checks.*/
-
-			default:
-			    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Decoder]: error decoding file: [%d]\n", ret);
-				switch_mutex_unlock(context->audio_mutex);
-				return SWITCH_STATUS_FALSE;
+			out_channels = 2;
+		} else {
+			/* op_read() returns the native channel count of the current link */
+			ret = op_read(context->of, (opus_int16 *)context->decode_buf, OPUS_MAX_PCM, &li);
+			out_channels = op_channel_count(context->of, li);
+			if (out_channels < 1) {
+				out_channels = channels;
 			}
+		}
+
+		if (ret < 0) {
+			if (ret == OP_HOLE) {
+				/* There was a hole in the data, and some samples may have been skipped. Call this function again to continue decoding past the hole. */
+				if (globals.debug) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Decoder]: hole in data, continuing\n");
+				}
+				continue;
+			}
+			/* OP_EREAD, OP_EFAULT, OP_EIMPL, OP_EINVAL, OP_ENOTFORMAT, OP_EBADHEADER,
+			   OP_EVERSION, OP_EBADPACKET, OP_EBADLINK, OP_EBADTIMESTAMP and anything else are fatal */
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Decoder]: error decoding file: [%d]\n", ret);
+			switch_mutex_unlock(context->audio_mutex);
+			return SWITCH_STATUS_FALSE;
 		} else if (ret == 0) {
 			/*The number of samples returned may be 0 if the buffer was too small to store even a single sample for both channels, or if end-of-file was reached*/
 			if (globals.debug) {
@@ -211,11 +221,11 @@ static switch_status_t switch_opusfile_decode(opus_file_context *context, void *
 			break;
 		} else /* (ret > 0)*/ {
 			/*The number of samples read per channel on success*/
-			switch_buffer_write(context->audio_buffer, (opus_int16 *)context->decode_buf, ret * sizeof(opus_int16) * channels);
+			switch_buffer_write(context->audio_buffer, (opus_int16 *)context->decode_buf, ret * sizeof(opus_int16) * out_channels);
 
 			if (globals.debug) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, 
-						"[OGG/OPUS Decoder]: Read samples: %d. Wrote bytes to buffer: [%d] bytes in use: [%u]\n", ret, (int)(ret * sizeof(int16_t) * channels), (unsigned int)buf_inuse);
+						"[OGG/OPUS Decoder]: Read samples: %d. Wrote bytes to buffer: [%d] bytes in use: [%u]\n", ret, (int)(ret * sizeof(int16_t) * out_channels), (unsigned int)buf_inuse);
 			}
 		}
 	}
@@ -229,6 +239,7 @@ static switch_status_t switch_opusfile_open(switch_file_handle_t *handle, const 
 	opus_file_context *context;
 	char *ext;
 	int ret;
+	uint32_t requested_rate;
 
 	if ((ext = strrchr(path, '.')) == 0) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS File] Invalid Format\n");
@@ -255,6 +266,9 @@ static switch_status_t switch_opusfile_open(switch_file_handle_t *handle, const 
 		}
 	}
 
+	/* remember what the caller asked for before we override it for reading */
+	requested_rate = handle->samplerate ? handle->samplerate : DEFAULT_RATE;
+
 	handle->samples = 0;
 	handle->samplerate = context->samplerate = DEFAULT_RATE; /*open files at 48 khz always*/
 	handle->format = 0;
@@ -264,26 +278,30 @@ static switch_status_t switch_opusfile_open(switch_file_handle_t *handle, const 
 	handle->pos = 0;
 	handle->private_info = context;
 	context->handle = handle;
-	memcpy(handle->file_path, path, strlen(path));
+	if (!handle->file_path) {
+		handle->file_path = switch_core_strdup(handle->memory_pool, path);
+	}
 
 #ifdef HAVE_OPUSFILE_ENCODE
 	if (switch_test_flag(handle, SWITCH_FILE_FLAG_WRITE)) {
-		int err; int mapping_family = 0;
+		int err;
 
+		/* libopusenc resamples internally, so encode at the rate we are fed */
+		handle->samplerate = context->samplerate = requested_rate;
+		if (handle->channels < 1) {
+			handle->channels = 1;
+		}
 		context->channels = handle->channels;
-		context->samplerate = handle->samplerate;
 		handle->seekable = 0;
 		context->comments = ope_comments_create();
 		ope_comments_add(context->comments, "METADATA", "Freeswitch/mod_opusfile");
-		// opus_multistream_surround_encoder_get_size() in libopus will check these
-		if ((context->channels > 2) && (context->channels <= 8)) {
-			mapping_family = 1;
-		} else if ((context->channels > 8) && (context->channels <= 255)) {
-			mapping_family = 255;
-		}
-		context->enc = ope_encoder_create_file(handle->file_path, context->comments, context->samplerate, context->channels, mapping_family, &err);
+		context->enc = ope_encoder_create_file(path, context->comments, (opus_int32)context->samplerate, context->channels, 
+				opusfile_mapping_family(context->channels), &err);
 		if (!context->enc) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Can't open file for writing [%d] [%s]\n", err, ope_strerror(err));
+			ope_comments_destroy(context->comments);
+			context->comments = NULL;
+			handle->private_info = NULL;
 			switch_thread_rwlock_unlock(context->rwlock);
 			return SWITCH_STATUS_FALSE;
 		}
@@ -294,9 +312,8 @@ static switch_status_t switch_opusfile_open(switch_file_handle_t *handle, const 
 	
 	context->of = op_open_file(path, &ret);
 	if (!context->of) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS File] Error opening %s\n", path);
-		switch_thread_rwlock_unlock(context->rwlock);
-		return SWITCH_STATUS_GENERR;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS File] Error opening %s [%d]\n", path, ret);
+		goto err;
 	}
 
 	if (switch_test_flag(handle, SWITCH_FILE_WRITE_APPEND)) {
@@ -310,7 +327,7 @@ static switch_status_t switch_opusfile_open(switch_file_handle_t *handle, const 
 	handle->channels = context->channels = op_channel_count(context->of, -1);
 	context->pcm_offset = op_pcm_tell(context->of);
 
-	if(context->pcm_offset!=0){
+	if (context->pcm_offset != 0) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS File] Non-zero starting PCM offset: [%li]\n", (long)context->pcm_offset);
 	}
 
@@ -326,7 +343,7 @@ static switch_status_t switch_opusfile_open(switch_file_handle_t *handle, const 
 	if (context->li != context->prev_li) {
 		const OpusHead *head;
 		const OpusTags *tags;
-		head=op_head(context->of, context->li);
+		head = op_head(context->of, context->li);
 		if (head) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS File] Channels: %i\n", head->channel_count);
 			if (head->input_sample_rate) {
@@ -337,18 +354,25 @@ static switch_status_t switch_opusfile_open(switch_file_handle_t *handle, const 
 			ogg_int64_t duration;
 			opus_int64  size;
 			duration = op_pcm_total(context->of, context->li);
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO , "[OGG/OPUS File] Duration (samples): %u\n", (unsigned int)duration);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO , "[OGG/OPUS File] Duration (samples): %lld\n", (long long)duration);
 			size = op_raw_total(context->of, context->li);
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,"[OGG/OPUS File] Size (bytes): %u\n", (unsigned int)size);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,"[OGG/OPUS File] Size (bytes): %lld\n", (long long)size);
 		}
 		tags = op_tags(context->of, context->li);
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS File] Encoded by: %s\n", tags->vendor);
+		if (tags && tags->vendor) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS File] Encoded by: %s\n", tags->vendor);
+		}
+		context->prev_li = context->li;
 	}
 
 	switch_thread_rwlock_unlock(context->rwlock);
 	return SWITCH_STATUS_SUCCESS;
 
 err:
+	if (context->audio_buffer) {
+		switch_buffer_destroy(&context->audio_buffer);
+	}
+	handle->private_info = NULL;
 	switch_thread_rwlock_unlock(context->rwlock);
 
 	return SWITCH_STATUS_FALSE;
@@ -358,59 +382,99 @@ static switch_status_t switch_opusfile_close(switch_file_handle_t *handle)
 {
 	opus_file_context *context = handle->private_info;
 
-	switch_thread_rwlock_rdlock(context->rwlock);
+	if (!context) {
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	/* exclusive: nobody else may be using the context while we tear it down */
+	switch_thread_rwlock_wrlock(context->rwlock);
 	if (context->of) {
 		op_free(context->of);
+		context->of = NULL;
 	}
 #ifdef HAVE_OPUSFILE_ENCODE
 	if (context->enc) {
 		ope_encoder_drain(context->enc);
 		ope_encoder_destroy(context->enc);
+		context->enc = NULL;
 	}
 	if (context->comments) {
 		ope_comments_destroy(context->comments);
+		context->comments = NULL;
 	}
 #endif 
 	if (context->audio_buffer) {
 		switch_buffer_destroy(&context->audio_buffer);
 	}
 	switch_thread_rwlock_unlock(context->rwlock);
+	handle->private_info = NULL;
 	return SWITCH_STATUS_SUCCESS;
 }
 
 static switch_status_t switch_opusfile_seek(switch_file_handle_t *handle, unsigned int *cur_sample, int64_t samples, int whence)
 {
 	int ret;
+	ogg_int64_t target;
 	opus_file_context *context = handle->private_info;
 
-	if (handle->handler || switch_test_flag(handle, SWITCH_FILE_FLAG_WRITE)) {
+	if (!context || !context->of || handle->handler || switch_test_flag(handle, SWITCH_FILE_FLAG_WRITE)) {
 		return SWITCH_STATUS_FALSE;
-	} else {
-		if (whence == SWITCH_SEEK_CUR) {
-			samples -= switch_buffer_inuse(context->audio_buffer) / sizeof(int16_t);
-		}
-		switch_buffer_zero(context->audio_buffer);
-		ret = op_pcm_seek(context->of, samples);
-		if (globals.debug) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,"[OGG/OPUS File] seek samples: [%u]\n", (unsigned int)samples);
-		}
-		if (ret == 0) {
-			handle->pos = *cur_sample = samples;
-			return SWITCH_STATUS_SUCCESS;
-		}
 	}
+
+	switch (whence) {
+	case SWITCH_SEEK_CUR:
+		/* handle->pos is what the caller has actually consumed (already excludes buffered audio) */
+		target = (ogg_int64_t)handle->pos + samples;
+		break;
+	case SWITCH_SEEK_END:
+		{
+			ogg_int64_t total = op_pcm_total(context->of, -1);
+			if (total < 0) {
+				return SWITCH_STATUS_FALSE;
+			}
+			target = total + samples;
+		}
+		break;
+	default:
+		target = samples;
+		break;
+	}
+
+	if (target < 0) {
+		target = 0;
+	}
+
+	switch_mutex_lock(context->audio_mutex);
+	switch_buffer_zero(context->audio_buffer);
+	ret = op_pcm_seek(context->of, target);
+	if (ret == 0) {
+		context->eof = SWITCH_FALSE;
+	}
+	switch_mutex_unlock(context->audio_mutex);
+
+	if (globals.debug) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,"[OGG/OPUS File] seek samples: [%lld] ret: [%d]\n", (long long)target, ret);
+	}
+
+	if (ret == 0) {
+		handle->pos = *cur_sample = (unsigned int)target;
+		return SWITCH_STATUS_SUCCESS;
+	}
+
 	return SWITCH_STATUS_FALSE;
 }
 
 static switch_status_t switch_opusfile_read(switch_file_handle_t *handle, void *data, size_t *len)
 {
 	opus_file_context *context = handle->private_info;
-	size_t bytes = *len * sizeof(int16_t) * handle->real_channels;
+	size_t bytes;
 	size_t rb = 0, newbytes;
 
 	if (!context) {
 		return SWITCH_STATUS_FALSE;
 	}
+
+	bytes = *len * sizeof(int16_t) * handle->real_channels;
 
 	if (!handle->handler) {
 		if (switch_opusfile_decode(context, data, bytes, handle->real_channels) == SWITCH_STATUS_FALSE) {
@@ -448,7 +512,7 @@ static switch_status_t switch_opusfile_read(switch_file_handle_t *handle, void *
 					"[OGG/OPUS File] Padding with empty audio. seconds: [%d] bytes: [%d] newbytes: [%d] real_channels: [%d]\n", 
 					(int)context->buffer_seconds, (int)bytes, (int)newbytes, (int)handle->real_channels);
 		}
-		memset(data, 255, bytes);
+		memset(data, 0, bytes); /* silence */
 		*len = bytes / sizeof(int16_t) / handle->real_channels;
 	}
 
@@ -463,7 +527,6 @@ static switch_status_t switch_opusfile_write(switch_file_handle_t *handle, void 
 #ifdef HAVE_OPUSFILE_ENCODE
 	size_t nsamples = *len;
 	int err;
-	int mapping_family = 0;
 
 	opus_file_context *context;
 
@@ -480,11 +543,10 @@ static switch_status_t switch_opusfile_write(switch_file_handle_t *handle, void 
 		context->comments = ope_comments_create();
 		ope_comments_add(context->comments, "METADATA", "Freeswitch/mod_opusfile");
 	}
-	if (context->channels > 2) {
-			mapping_family = 1;
-	}
 	if (!context->enc) {
-		context->enc = ope_encoder_create_file(handle->file_path, context->comments, handle->samplerate, handle->channels, mapping_family, &err);
+		int channels = handle->channels ? handle->channels : 1;
+		context->enc = ope_encoder_create_file(handle->file_path, context->comments, handle->samplerate, channels, 
+				opusfile_mapping_family(channels), &err);
 		if (!context->enc) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Can't open file for writing. err: [%d] [%s]\n", err, ope_strerror(err));
 			return SWITCH_STATUS_FALSE;
@@ -495,7 +557,8 @@ static switch_status_t switch_opusfile_write(switch_file_handle_t *handle, void 
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,"[OGG/OPUS File] write nsamples: [%d]\n", (int)nsamples);
 	}
 
-	err = ope_encoder_write(context->enc, (opus_int16 *)data, nsamples);
+	/* nsamples is per channel, which is what ope_encoder_write() expects */
+	err = ope_encoder_write(context->enc, (opus_int16 *)data, (int)nsamples);
 
 	if (err != OPE_OK) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS File] Can't encode. err: [%d] [%s]\n", err, ope_strerror(err));
@@ -503,10 +566,11 @@ static switch_status_t switch_opusfile_write(switch_file_handle_t *handle, void 
 	}
 
 	handle->sample_count += *len;
+	return SWITCH_STATUS_SUCCESS;
 #else
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "[OGG/OPUS File] Encoding support not built-in, build the module with libopusenc!\n");
+	return SWITCH_STATUS_FALSE;
 #endif 
-	return SWITCH_STATUS_SUCCESS;
 }
 
 static switch_status_t switch_opusfile_set_string(switch_file_handle_t *handle, switch_audio_col_t col, const char *string)
@@ -547,23 +611,25 @@ static switch_status_t switch_opusstream_set_initial(opus_stream_context_t *cont
 	/* https://www.opus-codec.org/docs/opusfile_api-0.5/group__stream__info.html#ga9272a4a6ac9e01fbc549008f5ff58b4c */
 
 	if (context->of) {
-		int ret;
+		ogg_int64_t pcm;
+		opus_int64 raw;
+
 		/* docs: "Obtain the PCM offset of the next sample to be read. " */
-		ret = op_pcm_tell(context->of);
-		if (ret != OP_EINVAL) {
-			context->pcm_offset = ret;
+		pcm = op_pcm_tell(context->of);
+		if (pcm >= 0) {
+			context->pcm_offset = pcm;
 		}
 		context->pcm_print_offset = context->pcm_offset - context->samplerate;
 
 		/* docs: "Obtain the current value of the position indicator for _of." */
-		ret = op_raw_tell(context->of);
-		if (ret != OP_EINVAL) {
-			context->raw_offset = ret;
+		raw = op_raw_tell(context->of);
+		if (raw >= 0) {
+			context->raw_offset = raw;
 		}
 
 		/* docs: "Get the channel count of the given link in a (possibly-chained) Ogg Opus stream. " */
 		context->dec_channels = op_channel_count(context->of, -1);
-		if (context->dec_channels == 0) {
+		if (context->dec_channels <= 0) {
 			context->dec_channels = 1;
 		}
 
@@ -580,50 +646,53 @@ static switch_status_t switch_opusstream_stream_info(opus_stream_context_t *cont
 	const OpusTags *tags;
 	opus_int32 bitrate;
 
-	if (context->of) {
-
-		/* docs: "Get the serial number of the given link in a (possibly-chained) Ogg Opus stream. "*/
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] SerialNO: [%u]\n", op_serialno(context->of, -1));
-		bitrate = op_bitrate_instant(context->of);
-		if (bitrate > 0) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] Bitrate: [%d]\n", bitrate);
-		}
-
-		if(context->pcm_offset!=0){
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] Non-zero starting PCM offset: [%li]\n", 
-					(long)context->pcm_offset);
-		}
-
-		/* docs: "Retrieve the index of the current link." */
-		context->li = op_current_link(context->of);
-
-		/* docs: "Get the ID header information for the given link in a (possibly chained) Ogg Opus stream. " */
-		head = op_head(context->of, context->li);
-		if (head) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] Channels: [%i]\n", head->channel_count);
-			if (head->input_sample_rate) {
-				context->samplerate = head->input_sample_rate;
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] Original sampling rate: [%lu] Hz\n", 
-						(unsigned long)head->input_sample_rate);
-			}
-		}
-		/*docs: "Returns whether or not the data source being read is seekable."*/
-		if (op_seekable(context->of)) {
-			opus_int64  size;
-			context->duration = op_pcm_total(context->of, context->li); // page duration 
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO , "[OGG/OPUS Stream Decode] Duration (samples): [%u]\n", (unsigned int)context->duration);
-			size = op_raw_total(context->of, context->li);
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,"[OGG/OPUS Stream Decode] Size (bytes): [%u]\n", (unsigned int)size);
-		}
-		/* docs: "Get the comment header information for the given link in a (possibly chained) Ogg Opus stream." */
-		tags = op_tags(context->of, context->li);
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] Encoded by: [%s]\n", tags->vendor);
+	if (!context->of) {
 		return SWITCH_STATUS_FALSE;
+	}
+
+	/* docs: "Get the serial number of the given link in a (possibly-chained) Ogg Opus stream. "*/
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] SerialNO: [%u]\n", (unsigned int)op_serialno(context->of, -1));
+	bitrate = op_bitrate_instant(context->of);
+	if (bitrate > 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] Bitrate: [%d]\n", bitrate);
+	}
+
+	if (context->pcm_offset != 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] Non-zero starting PCM offset: [%li]\n", 
+				(long)context->pcm_offset);
+	}
+
+	/* docs: "Retrieve the index of the current link." */
+	context->li = op_current_link(context->of);
+
+	/* docs: "Get the ID header information for the given link in a (possibly chained) Ogg Opus stream. " */
+	head = op_head(context->of, context->li);
+	if (head) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] Channels: [%i]\n", head->channel_count);
+		if (head->input_sample_rate) {
+			/* informational only: libopusfile always decodes at 48 kHz */
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] Original sampling rate: [%lu] Hz\n", 
+					(unsigned long)head->input_sample_rate);
+		}
+	}
+	/*docs: "Returns whether or not the data source being read is seekable."*/
+	if (op_seekable(context->of)) {
+		opus_int64  size;
+		context->duration = op_pcm_total(context->of, context->li); // page duration 
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO , "[OGG/OPUS Stream Decode] Duration (samples): [%lld]\n", (long long)context->duration);
+		size = op_raw_total(context->of, context->li);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,"[OGG/OPUS Stream Decode] Size (bytes): [%lld]\n", (long long)size);
+	}
+	/* docs: "Get the comment header information for the given link in a (possibly chained) Ogg Opus stream." */
+	tags = op_tags(context->of, context->li);
+	if (tags && tags->vendor) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] Encoded by: [%s]\n", tags->vendor);
 	}
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t switch_opusstream_stream_decode(opus_stream_context_t *context, void *data, int channels)
+/* decodes whatever is available and leaves it in audio_buffer as interleaved PCM with out_channels channels */
+static switch_status_t switch_opusstream_stream_decode(opus_stream_context_t *context, void *data, int out_channels)
 {
 	int ret;
 	size_t buf_inuse;
@@ -632,76 +701,70 @@ static switch_status_t switch_opusstream_stream_decode(opus_stream_context_t *co
 	if (!context->of) {
 		return SWITCH_STATUS_FALSE;
 	}
+	if (out_channels < 1 || out_channels > 2) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream] Invalid number of channels [%d]!\n", out_channels);
+		return SWITCH_STATUS_FALSE;
+	}
+
 	memset(context->decode_buf, 0, sizeof(context->decode_buf));
 	switch_mutex_lock(context->audio_mutex);
 	while (!(context->eof)) {
+		int downmix = 0;
 
-		if (channels == 1) {
-			ret = op_read(context->of, (opus_int16 *)context->decode_buf, OPUS_MAX_PCM, NULL);
-		} else if (channels > 1) {
+		if (out_channels == 2) {
+			/* op_read_stereo() upmixes mono / downmixes multichannel to stereo */
 			ret = op_read_stereo(context->of, (opus_int16 *)context->decode_buf, OPUS_MAX_PCM);
+		} else if (context->dec_channels == 1) {
+			ret = op_read(context->of, (opus_int16 *)context->decode_buf, OPUS_MAX_PCM, NULL);
 		} else {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream] Invalid number of channels!\n");
-				switch_goto_status(SWITCH_STATUS_FALSE, end);
+			/* mono codec, multichannel stream: get stereo and fold it down */
+			ret = op_read_stereo(context->of, (opus_int16 *)context->decode_buf, OPUS_MAX_PCM);
+			downmix = 1;
 		}
 
 		if (ret < 0) {
-			switch(ret) {
-			case OP_HOLE:	/* There was a hole in the data, and some samples may have been skipped. Call this function again to continue decoding past the hole.*/
+			if (ret == OP_HOLE) {
+				/* There was a hole in the data, and some samples may have been skipped. Call this function again to continue decoding past the hole.*/
 				if (!context->dec_page_ready) {
 					if (globals.debug) {
 						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Decoder]: incomplete ogg page, will retry\n");
 					}
 					switch_goto_status(SWITCH_STATUS_SUCCESS, end);
 				}
-				break;
-			case OP_EREAD:	/*An underlying read operation failed. This may signal a truncation attack from an <https:> source.*/
-			
-			case OP_EFAULT: /*	An internal memory allocation failed. */
-
-			case OP_EIMPL:	/*An unseekable stream encountered a new link that used a feature that is not implemented, such as an unsupported channel family.*/
-
-			case OP_EINVAL:	/* The stream was only partially open. */
-
-			case OP_ENOTFORMAT: /*	An unseekable stream encountered a new link that did not have any logical Opus streams in it. */
-
-			case OP_EBADHEADER:	/*An unseekable stream encountered a new link with a required header packet that was not properly formatted, contained illegal values, or was missing altogether.*/
-
-			case OP_EVERSION:	/*An unseekable stream encountered a new link with an ID header that contained an unrecognized version number.*/
-
-			case OP_EBADPACKET: /*Failed to properly decode the next packet.*/
-
-			case OP_EBADLINK:		/*We failed to find data we had seen before.*/
-
-			case OP_EBADTIMESTAMP:		/*An unseekable stream encountered a new link with a starting timestamp that failed basic validity checks.*/
-
-			default:
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Decoder]: error decoding stream: [%d]\n", ret);
-				switch_goto_status(SWITCH_STATUS_FALSE, end);
+				continue;
 			}
+			/* any other error is fatal */
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Decoder]: error decoding stream: [%d]\n", ret);
+			switch_goto_status(SWITCH_STATUS_FALSE, end);
 		} else if (ret == 0) {
 			/*The number of samples returned may be 0 if the buffer was too small to store even a single sample for both channels, or if end-of-file was reached*/
 			if (globals.debug) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Decoder]: EOF reached [%d]\n", ret);
 			}
 
-			context->eof = TRUE;
+			context->eof = SWITCH_TRUE;
 			break;
 		} else /* (ret > 0)*/ {
 			/*The number of samples read per channel on success*/
-			switch_buffer_write(context->audio_buffer, (opus_int16 *)context->decode_buf, ret * sizeof(opus_int16) * channels);
+			if (downmix) {
+				int i;
+				for (i = 0; i < ret; i++) {
+					context->decode_buf[i] = (opus_int16)(((int)context->decode_buf[2 * i] + (int)context->decode_buf[2 * i + 1]) / 2);
+				}
+			}
+			switch_buffer_write(context->audio_buffer, (opus_int16 *)context->decode_buf, ret * sizeof(opus_int16) * out_channels);
 			buf_inuse = switch_buffer_inuse(context->audio_buffer);
 
 			if (globals.debug) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, 
-						"[OGG/OPUS Decoder]: Read samples: %d. Wrote bytes to buffer: [%d] bytes in use: [%u] byte pos stream: [%lu]\n", 
-						ret, (int)(ret * sizeof(int16_t) * channels), (unsigned int)buf_inuse, (long unsigned int)op_raw_tell(context->of));
+						"[OGG/OPUS Decoder]: Read samples: %d. Wrote bytes to buffer: [%d] bytes in use: [%u] byte pos stream: [%lld]\n", 
+						ret, (int)(ret * sizeof(int16_t) * out_channels), (unsigned int)buf_inuse, (long long)op_raw_tell(context->of));
 			}
 		}
 	}
 
 end:
-	context->eof = FALSE; // for next page 
+	context->eof = SWITCH_FALSE; // for next page 
 
 	switch_mutex_unlock(context->audio_mutex);
 
@@ -721,80 +784,97 @@ static switch_status_t switch_opusstream_init(switch_codec_t *codec, switch_code
 
 	if (!(encoding || decoding) || (!(context = switch_core_alloc(codec->memory_pool, sizeof(struct opus_stream_context))))) {
 		return SWITCH_STATUS_FALSE;
-	} else {
-
-		memset(context, 0, sizeof(struct opus_stream_context));
-		codec->private_info = context;
-		context->pool = codec->memory_pool;
-
-		switch_thread_rwlock_create(&(context->rwlock), context->pool);
-
-		switch_thread_rwlock_rdlock(context->rwlock);
-
-		switch_mutex_init(&context->audio_mutex, SWITCH_MUTEX_NESTED, context->pool);
-		switch_mutex_init(&context->ogg_mutex, SWITCH_MUTEX_NESTED, context->pool);
-
-		if (switch_buffer_create_dynamic(&context->audio_buffer, TC_BUFFER_SIZE, TC_BUFFER_SIZE * 2, 0) != SWITCH_STATUS_SUCCESS) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Memory Error!\n");
-			switch_thread_rwlock_unlock(context->rwlock);
-			return SWITCH_STATUS_MEMERR;
-		}
-
-		if (switch_buffer_create_dynamic(&context->ogg_buffer, TC_BUFFER_SIZE, TC_BUFFER_SIZE * 2, 0) != SWITCH_STATUS_SUCCESS) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Memory Error!\n");
-			switch_thread_rwlock_unlock(context->rwlock);
-			return SWITCH_STATUS_MEMERR;
-		}
-
-		context->samplerate = codec->implementation->actual_samples_per_second;
-		context->frame_size = codec->implementation->actual_samples_per_second * (codec->implementation->microseconds_per_packet / 1000) / 1000;
-
-		if (globals.debug) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream] frame_size: [%d]\n", (int)context->frame_size);
-		}
-#ifdef HAVE_OPUSFILE_ENCODE
-		if (encoding) {
-			if (!context->comments) {
-				context->comments = ope_comments_create();
-				ope_comments_add(context->comments, "METADATA", "Freeswitch/mod_opusfile");
-			}
-			if (!context->enc) {
-				int mapping_family = 0;
-				// opus_multistream_surround_encoder_get_size() in libopus will check these
-				if ((context->enc_channels > 2) && (context->enc_channels <= 8)) {
-					mapping_family = 1;
-				} else if ((context->enc_channels > 8) && (context->enc_channels <= 255)) {
-					// multichannel/multistream mapping family . https://people.xiph.org/~giles/2013/draft-ietf-codec-oggopus.html#rfc.section.5.1.1
-					mapping_family = 255;
-				}
-				context->enc = ope_encoder_create_pull(context->comments, !context->samplerate?DEFAULT_RATE:context->samplerate, !context->enc_channels?1:context->enc_channels, mapping_family, &err);
-
-				if (!context->enc) {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream Encode] Can't create stream. err: [%d] [%s]\n", err, ope_strerror(err));
-					switch_thread_rwlock_unlock(context->rwlock);
-					return SWITCH_STATUS_FALSE;
-				} else {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Encode] Stream opened for encoding\n"); 
-				}
-				ope_encoder_ctl(context->enc, OPUS_SET_COMPLEXITY_REQUEST, 5);
-				ope_encoder_ctl(context->enc, OPUS_SET_APPLICATION_REQUEST, OPUS_APPLICATION_VOIP);
-			}
-		}
-#endif 
-		switch_thread_rwlock_unlock(context->rwlock);
-		return SWITCH_STATUS_SUCCESS;
 	}
+
+	memset(context, 0, sizeof(struct opus_stream_context));
+	codec->private_info = context;
+	context->pool = codec->memory_pool;
+
+	switch_thread_rwlock_create(&(context->rwlock), context->pool);
+
+	switch_thread_rwlock_rdlock(context->rwlock);
+
+	switch_mutex_init(&context->audio_mutex, SWITCH_MUTEX_NESTED, context->pool);
+	switch_mutex_init(&context->ogg_mutex, SWITCH_MUTEX_NESTED, context->pool);
+
+	if (switch_buffer_create_dynamic(&context->audio_buffer, TC_BUFFER_SIZE, TC_BUFFER_SIZE * 2, 0) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Memory Error!\n");
+		goto fail;
+	}
+
+	if (switch_buffer_create_dynamic(&context->ogg_buffer, TC_BUFFER_SIZE, TC_BUFFER_SIZE * 2, 0) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Memory Error!\n");
+		goto fail;
+	}
+
+	context->samplerate = codec->implementation->actual_samples_per_second;
+	/* samples per channel per frame */
+	context->frame_size = codec->implementation->actual_samples_per_second * (codec->implementation->microseconds_per_packet / 1000) / 1000;
+	context->codec_channels = codec->implementation->number_of_channels > 0 ? codec->implementation->number_of_channels : 1;
+	context->dec_channels = context->codec_channels;
+
+	if (globals.debug) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream] frame_size: [%d] channels: [%d]\n", 
+				(int)context->frame_size, context->codec_channels);
+	}
+#ifdef HAVE_OPUSFILE_ENCODE
+	if (encoding) {
+		context->enc_channels = context->codec_channels;
+		if (!context->comments) {
+			context->comments = ope_comments_create();
+			ope_comments_add(context->comments, "METADATA", "Freeswitch/mod_opusfile");
+		}
+		if (!context->enc) {
+			context->enc = ope_encoder_create_pull(context->comments, !context->samplerate ? DEFAULT_RATE : (opus_int32)context->samplerate, 
+					context->enc_channels, opusfile_mapping_family(context->enc_channels), &err);
+
+			if (!context->enc) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream Encode] Can't create stream. err: [%d] [%s]\n", err, ope_strerror(err));
+				goto fail;
+			} else {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Encode] Stream opened for encoding\n"); 
+			}
+			ope_encoder_ctl(context->enc, OPUS_SET_COMPLEXITY_REQUEST, 5);
+			ope_encoder_ctl(context->enc, OPUS_SET_APPLICATION_REQUEST, OPUS_APPLICATION_VOIP);
+			/* libopusenc holds audio back for up to 2 s by default to choose frame sizes; a live stream can't wait */
+			ope_encoder_ctl(context->enc, OPE_SET_DECISION_DELAY(0));
+		}
+	}
+#endif 
+	switch_thread_rwlock_unlock(context->rwlock);
+	return SWITCH_STATUS_SUCCESS;
+
+fail:
+#ifdef HAVE_OPUSFILE_ENCODE
+	if (context->comments) {
+		ope_comments_destroy(context->comments);
+		context->comments = NULL;
+	}
+#endif
+	if (context->audio_buffer) {
+		switch_buffer_destroy(&context->audio_buffer);
+	}
+	if (context->ogg_buffer) {
+		switch_buffer_destroy(&context->ogg_buffer);
+	}
+	switch_thread_rwlock_unlock(context->rwlock);
+	codec->private_info = NULL;
+	return SWITCH_STATUS_FALSE;
 }
 
 static switch_status_t switch_opusstream_destroy(switch_codec_t *codec)
 {
 	struct opus_stream_context *context = codec->private_info;
 	switch_status_t st;
-	
-	switch_thread_rwlock_rdlock(context->rwlock);
-	
+
+	if (!context) {
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	/* join first: the reader thread takes a read lock, so we can't hold the write lock while waiting for it */
 	if (context->read_stream_thread) {
 		switch_thread_join(&st, context->read_stream_thread);
+		context->read_stream_thread = NULL;
 		if (st == SWITCH_STATUS_SUCCESS) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Encode/Decode] Joined decoding thread\n");
 		} else {
@@ -802,16 +882,21 @@ static switch_status_t switch_opusstream_destroy(switch_codec_t *codec)
 		}
 	}
 
+	switch_thread_rwlock_wrlock(context->rwlock);
+
 	if (context->of) {
 		op_free(context->of);
+		context->of = NULL;
 	}
 
 #ifdef HAVE_OPUSFILE_ENCODE
 	if (context->enc) {
 		ope_encoder_destroy(context->enc);
+		context->enc = NULL;
 	}
 	if (context->comments) {
 		ope_comments_destroy(context->comments);
+		context->comments = NULL;
 	}
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Encode/Decode] Encoded pages: [%u]\n", context->enc_pagecount);
 #endif 
@@ -841,80 +926,90 @@ static switch_status_t switch_opusstream_encode(switch_codec_t *codec,
 	switch_status_t status = SWITCH_STATUS_SUCCESS;
 #ifdef HAVE_OPUSFILE_ENCODE
 	struct opus_stream_context *context = codec->private_info;
-	size_t nsamples = (int)decoded_data_len / sizeof(int16_t);
+	size_t nsamples = decoded_data_len / sizeof(int16_t); /* total interleaved samples */
+	size_t samples_per_channel;
 	int err, ret;
-	int len = 0; int thres;
+	opus_int32 len = 0;
+	size_t thres;
+	int flush = 0;
 	unsigned char *decode_buf = decoded_data;
+
+	*encoded_data_len = 0;
 
 	if (!context) {
 		return SWITCH_STATUS_FALSE;
 	}
 
-	globals.debug = 0;
 	switch_thread_rwlock_rdlock(context->rwlock);
 
-	if (globals.debug) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-				"[OGG/OPUS Stream Encode] : switch_opusfile_stream_encode() decoded_data [%x][%x][%x][%x] nsamples: [%d]\n", 
-				decode_buf[0], decode_buf[1], decode_buf[2], decode_buf[3], (int)nsamples);
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Encode] stream write nsamples: [%d]\n", (int)nsamples);
-	}
-	if (context->enc_channels == 0) {
+	if (context->enc_channels <= 0) {
 		context->enc_channels = 1;
 	}
 	if (!context->samplerate) {
 		context->samplerate = DEFAULT_RATE;
 	}
+	samples_per_channel = nsamples / context->enc_channels;
 
-	if (context->enc) {
-		// we reach here every 20 ms.
-		// decoded_data - this can be an interleaved buffer, to do multistream. we’ll need the exact number of channels too.
-		err = ope_encoder_write(context->enc, (opus_int16 *)decoded_data, nsamples / context->enc_channels);
-		if (err != OPE_OK) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream Encode] can't encode, ret: [%d] [%s]\n", err, ope_strerror(err));
-			switch_goto_status(SWITCH_STATUS_FALSE, end);
-		}
-		context->samples_encode += nsamples;
+	if (globals.debug) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+				"[OGG/OPUS Stream Encode] : switch_opusfile_stream_encode() decoded_data [%x][%x][%x][%x] nsamples: [%d]\n", 
+				decode_buf[0], decode_buf[1], decode_buf[2], decode_buf[3], (int)nsamples);
 	}
 
-	thres = context->samplerate/PAGES_PER_SEC;
+	if (!context->enc) {
+		switch_goto_status(SWITCH_STATUS_FALSE, end);
+	}
 
-	if (!(context->samples_encode % thres) && context->samples_encode > context->samplerate) {
-		if (context->enc) {
-			unsigned char *vb = context->encode_buf;
-			int req_flush = 1; 
-			/* OPE_EXPORT int ope_encoder_get_page(OggOpusEnc *enc, unsigned char **page, opus_int32 *len, int flush); */
-			ret = ope_encoder_get_page(context->enc, &vb, &len, req_flush);
-			if (ret == 0) {
-				/* ope_encoder_get_page(): ret is 1 if there is a page available, 0 if not. */
-				if (globals.debug) {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Encode] can't retrieve encoded page, page not ready. ret: [%d]\n", ret);
-				}
-				switch_goto_status(SWITCH_STATUS_SUCCESS, end);
-			} else {
-				if (globals.debug) {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Encode] retrieved page from encoder. ret [%d] len: [%d] [%p]\n", 
-							ret, len, context->encode_buf);
-				}
-				if (len > OGG_MAX_PAGE_SIZE) {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream Encode] retrieved page bigger than ogg max size!\n");
-					switch_goto_status(SWITCH_STATUS_FALSE, end);
-				}
-				memcpy(encoded_data, vb, len);
-				*encoded_data_len = len;
-				context->enc_pagecount++;
-				switch_thread_rwlock_unlock(context->rwlock);
-				return SWITCH_STATUS_SUCCESS;
+	// we reach here every 20 ms.
+	// decoded_data is interleaved; ope_encoder_write() wants samples per channel.
+	err = ope_encoder_write(context->enc, (opus_int16 *)decoded_data, (int)samples_per_channel);
+	if (err != OPE_OK) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream Encode] can't encode, ret: [%d] [%s]\n", err, ope_strerror(err));
+		switch_goto_status(SWITCH_STATUS_FALSE, end);
+	}
+	context->samples_encode += samples_per_channel;
+	context->samples_since_page += samples_per_channel;
+
+	/* force a page out PAGES_PER_SEC times a second, once the first second of audio has been buffered.
+	   Use a counter instead of a modulo, which only fired when frame size happened to divide the threshold. */
+	thres = context->samplerate / PAGES_PER_SEC;
+	if (context->samples_encode > context->samplerate && context->samples_since_page >= thres) {
+		flush = 1;
+		context->samples_since_page = 0;
+	}
+
+	{
+		unsigned char *vb = NULL;
+		/* ret is 1 if there is a page available, 0 if not. Without flush this also drains pages the encoder completed on its own. */
+		ret = ope_encoder_get_page(context->enc, &vb, &len, flush);
+		if (ret == 0 || !vb || len <= 0) {
+			if (globals.debug && flush) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Encode] page not ready. ret: [%d]\n", ret);
 			}
-		} else {
+			switch_goto_status(SWITCH_STATUS_SUCCESS, end);
+		}
+
+		if (globals.debug) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Encode] retrieved page from encoder. ret [%d] len: [%d]\n", ret, (int)len);
+		}
+		/* callers don't reliably pass their buffer size in *encoded_data_len (it is often the previous
+		   page length), but every caller allocates SWITCH_RECOMMENDED_BUFFER_SIZE: never write past that */
+		if (len > SWITCH_RECOMMENDED_BUFFER_SIZE) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream Encode] retrieved page [%d] bytes doesn't fit output buffer [%d]!\n", 
+					(int)len, SWITCH_RECOMMENDED_BUFFER_SIZE);
 			switch_goto_status(SWITCH_STATUS_FALSE, end);
 		}
+		memcpy(encoded_data, vb, len);
+		*encoded_data_len = (uint32_t)len;
+		context->enc_pagecount++;
 	}
+
 end: 
-	*encoded_data_len = 0;
 	switch_thread_rwlock_unlock(context->rwlock);
 #else
+	*encoded_data_len = 0;
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "[OGG/OPUS Stream Encode] Encoding support not built-in, build the module with libopusenc!\n");
+	status = SWITCH_STATUS_FALSE;
 #endif 
 	return status;
 }
@@ -924,56 +1019,53 @@ end:
 static int decode_stream_cb(void *dcontext, unsigned char *data, int nbytes) 
 {
 	opus_stream_context_t *context = (opus_stream_context_t *)dcontext;
-	unsigned int ret = 0;
+	switch_size_t ret = 0;
 	
-	if (!context) {
+	if (!context || !data || nbytes <= 0) {
 		return 0;
 	}
 
 	if (globals.debug) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] decode CB called: context: %p data: %p packet_len: %d\n", 
-				(void *)context, data, nbytes);
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] decode_stream_cb(): switch_thread_self(): %lx\n", (unsigned long)(intptr_t)switch_thread_self());
+				(void *)context, (void *)data, nbytes);
 	}
 
 	switch_mutex_lock(context->ogg_mutex);
-	ret = switch_buffer_read(context->ogg_buffer, context->ogg_data, nbytes);
+	/* read straight into libopusfile's buffer; ogg_data is shared scratch space and must not be clobbered here */
+	ret = switch_buffer_read(context->ogg_buffer, data, nbytes);
 	if (ret == 0) {
-		data = NULL;
 		switch_mutex_unlock(context->ogg_mutex);
 		if (globals.debug) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] No data. Wanted: [%d] bytes\n", nbytes);
 		}
-		return ret;
+		return 0;
 	}
 	context->dec_count++;
-	memcpy(data, context->ogg_data, ret);
 
 	if (switch_buffer_inuse(context->ogg_buffer)) {
-		context->dec_page_ready = 0;
+		context->dec_page_ready = SWITCH_FALSE;
 	} else {
-		context->dec_page_ready = 1;
+		context->dec_page_ready = SWITCH_TRUE;
 		if (globals.debug) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] buffer is empty, all pages passed to the decoder\n");
 		}
-
 	}
 	switch_mutex_unlock(context->ogg_mutex);
 
 	if (globals.debug) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] decode_stream_cb(): ret: %u\n",  ret);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] decode_stream_cb(): ret: %u\n", (unsigned int)ret);
 	}
-	return ret;
+	return (int)ret;
 }
 
-const OpusFileCallbacks cb={decode_stream_cb, NULL, NULL, NULL};
+static const OpusFileCallbacks cb = {decode_stream_cb, NULL, NULL, NULL};
 
 static void *SWITCH_THREAD_FUNC read_stream_thread(switch_thread_t *thread, void *obj)
 {
 	opus_stream_context_t *context = (opus_stream_context_t *) obj;
 	int err = 0;
 	OggOpusFile *temp_of = NULL;
-	int buffered_ogg_bytes;
+	switch_size_t buffered_ogg_bytes;
 
 	if (globals.debug) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] read_stream_thread(): switch_thread_self(): 0x%lx\n", (unsigned long)(intptr_t)switch_thread_self());
@@ -981,48 +1073,33 @@ static void *SWITCH_THREAD_FUNC read_stream_thread(switch_thread_t *thread, void
 	switch_thread_rwlock_rdlock(context->rwlock);
 	switch_mutex_lock(context->ogg_mutex);
 
+	context->ogg_data_len = 0;
 	if ((buffered_ogg_bytes = switch_buffer_inuse(context->ogg_buffer))) {
-		if (buffered_ogg_bytes <= OGG_MAX_PAGE_SIZE) {
-			switch_buffer_peek(context->ogg_buffer, context->ogg_data, buffered_ogg_bytes);
-			context->ogg_data_len = buffered_ogg_bytes;
+		if (buffered_ogg_bytes > sizeof(context->ogg_data)) {
+			buffered_ogg_bytes = sizeof(context->ogg_data);
 		}
+		/* consume (not peek) the initial data: op_open_callbacks() treats it as already read,
+		   so leaving it in the buffer would make the read callback hand the same bytes over twice */
+		context->ogg_data_len = (unsigned int)switch_buffer_read(context->ogg_buffer, context->ogg_data, buffered_ogg_bytes);
 	} 
 
-	/* https://mf4.xiph.org/jenkins/view/opus/job/opusfile-unix/ws/doc/html/group__stream__open__close.html#gad183ecf5fbec5add3a5ccf1e3b1d2593  */
 	/* docs: "Open a stream using the given set of callbacks to access it." */
 	temp_of = op_open_callbacks(context, &cb, (const unsigned char *)context->ogg_data, context->ogg_data_len, &err);
 	if (temp_of && (err == 0)) {
-		context->dec_page_ready = 1; 
+		context->dec_page_ready = SWITCH_TRUE; 
 		context->of = temp_of;
 		if (globals.debug) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "[OGG/OPUS Stream Decode] Opened stream, installed decoding callback!\n");
 		}
 		switch_opusstream_set_initial(context);
 		switch_opusstream_stream_info(context);
-	} else if (err != 0) {
-		switch (err) {
-			case OP_EREAD:
-			   //  An underlying read, seek, or tell operation failed when it should have succeeded, or we failed to find data in the stream we had seen before. 
-			case OP_EFAULT:
-				//    There was a memory allocation failure, or an internal library error. 
-			case OP_EIMPL:
-				// The stream used a feature that is not implemented, such as an unsupported channel family. 
-			case OP_EINVAL:
-				// seek() was implemented and succeeded on this source, but tell() did not, or the starting position indicator was not equal to _initial_bytes. 
-			case OP_ENOTFORMAT:
-				// The stream contained a link that did not have any logical Opus streams in it. 
-			case OP_EBADHEADER:
-				// A required header packet was not properly formatted, contained illegal values, or was missing altogether. 
-			case OP_EVERSION:
-				// An ID header contained an unrecognized version number. 
-			case OP_EBADLINK:
-				// We failed to find data we had seen before after seeking. 
-			case OP_EBADTIMESTAMP:
-				// The first or last timestamp in a link failed basic validity checks
-			default:
-				context->dec_page_ready = 0;
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream Decode] error opening stream: [%d]\n", err);
+	} else {
+		/* OP_EREAD, OP_EFAULT, OP_EIMPL, OP_EINVAL, OP_ENOTFORMAT, OP_EBADHEADER, OP_EVERSION, OP_EBADLINK, OP_EBADTIMESTAMP ... */
+		if (temp_of) {
+			op_free(temp_of);
 		}
+		context->dec_page_ready = SWITCH_FALSE;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream Decode] error opening stream: [%d]\n", err);
 	}
 
 	switch_mutex_unlock(context->ogg_mutex);
@@ -1051,16 +1128,17 @@ static switch_status_t switch_opusstream_decode(switch_codec_t *codec,
 {
 	struct opus_stream_context *context = codec->private_info;
 	size_t bytes = 0; 
-	int ogg_bytes = OGG_MIN_PAGE_SIZE; // min page size before trying to open the incoming stream 
+	size_t ogg_bytes = OGG_MIN_PAGE_SIZE; // min page size before trying to open the incoming stream 
 	size_t rb = 0;
 	unsigned char *encode_buf = encoded_data;
 	size_t buffered_ogg_bytes = 0;
 	switch_status_t status = SWITCH_STATUS_SUCCESS;
 
 	if (!context) {
+		*decoded_data_len = 0;
 		return SWITCH_STATUS_FALSE;
 	}
-	if (globals.debug) {
+	if (globals.debug && encoded_data_len >= 4) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
 				"[OGG/OPUS Stream Decode] : switch_opusstream_decode() encoded_data [%x][%x][%x][%x] encoded_data_len: [%u]\n", 
 				encode_buf[0], encode_buf[1], encode_buf[2], encode_buf[3], encoded_data_len);
@@ -1077,27 +1155,33 @@ static switch_status_t switch_opusstream_decode(switch_codec_t *codec,
 
 	switch_thread_rwlock_rdlock(context->rwlock);
 	switch_mutex_lock(context->ogg_mutex);
-	memset(context->ogg_data, 0, sizeof(context->ogg_data)); 
 	if (encoded_data_len <= SWITCH_RECOMMENDED_BUFFER_SIZE) {
-		switch_buffer_write(context->ogg_buffer, encode_buf, encoded_data_len);
+		if (encoded_data_len) {
+			switch_buffer_write(context->ogg_buffer, encode_buf, encoded_data_len);
+		}
  
-		if ((buffered_ogg_bytes = switch_buffer_inuse(context->ogg_buffer)) >= ogg_bytes) {
-			if (globals.debug) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-						"[OGG/OPUS Stream Decode] switch_opusstream_decode() encoded_data [%x][%x][%x][%x] encoded_data_len: %u buffered_ogg_bytes: [%u]\n", 
-						encode_buf[0], encode_buf[1], encode_buf[2], encode_buf[3], encoded_data_len, (unsigned int)buffered_ogg_bytes);
-			}
+		/* before the stream is open we peek at the buffered data to probe it */
+		if (!context->read_stream && (buffered_ogg_bytes = switch_buffer_inuse(context->ogg_buffer)) >= ogg_bytes) {
 			if (buffered_ogg_bytes <= OGG_MAX_PAGE_SIZE) {
+				memset(context->ogg_data, 0, sizeof(context->ogg_data)); 
 				switch_buffer_peek(context->ogg_buffer, context->ogg_data, buffered_ogg_bytes);
-				context->ogg_data_len = buffered_ogg_bytes;
-			}	else {
+				context->ogg_data_len = (unsigned int)buffered_ogg_bytes;
+			} else {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream Decode] buffered ogg data bigger than max OGG page size, will flush\n");
 				*decoded_data_len = 0;
 				switch_buffer_zero(context->ogg_buffer);
 				switch_goto_status(SWITCH_STATUS_SUCCESS, end);
 			}
-		}
 
+			/* op_test() returns 0 if this looks like the start of an Ogg Opus stream */
+			if (!op_test(NULL, context->ogg_data, buffered_ogg_bytes)) {
+				if (globals.debug) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] launching decoding thread\n");
+				}
+				context->read_stream = SWITCH_TRUE; // mark thread started
+				launch_read_stream_thread(context);
+			}
+		}
 	} else {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "[OGG/OPUS Stream Decode] too much data to buffer, flushing buffer!\n");
 		*decoded_data_len = 0;
@@ -1105,20 +1189,8 @@ static switch_status_t switch_opusstream_decode(switch_codec_t *codec,
 		switch_goto_status(SWITCH_STATUS_SUCCESS, end);
 	}
 
-	if ((buffered_ogg_bytes >= ogg_bytes) && encoded_data_len) {
-
-		if (!(op_test(NULL, context->ogg_data, buffered_ogg_bytes))) {
-			if (!context->read_stream && buffered_ogg_bytes > OGG_MIN_PAGE_SIZE) {
-				if (globals.debug) {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] launching decoding thread\n");
-				}
-				launch_read_stream_thread(context);
-				context->read_stream = 1; // mark thread started
-			}
-		} 
-	}
 	if (context->of) {
-		if (switch_opusstream_stream_decode(context, context->ogg_data, context->dec_channels) == SWITCH_STATUS_FALSE) {
+		if (switch_opusstream_stream_decode(context, context->ogg_data, context->codec_channels) == SWITCH_STATUS_FALSE) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[OGG/OPUS Stream Decode] Cannot decode stream\n");
 			*decoded_data_len = 0;
 			switch_goto_status(SWITCH_STATUS_FALSE, end);
@@ -1126,18 +1198,19 @@ static switch_status_t switch_opusstream_decode(switch_codec_t *codec,
 	}
 	switch_mutex_lock(context->audio_mutex);
 	bytes = switch_buffer_inuse(context->audio_buffer);
-	rb = switch_buffer_read(context->audio_buffer, decoded_data, context->frame_size * sizeof(int16_t));
+	/* one frame, all channels */
+	rb = switch_buffer_read(context->audio_buffer, decoded_data, context->frame_size * sizeof(int16_t) * context->codec_channels);
 	switch_mutex_unlock(context->audio_mutex);
 
 	if (globals.debug) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "[OGG/OPUS Stream Decode] rb (read from audio_buffer): [%d] bytes in audio buffer: [%d]\n", (int)rb, (int)bytes);
 	}
 
-	*decoded_data_len = rb ; // bytes
+	*decoded_data_len = (uint32_t)rb; // bytes
 end:
 
-	switch_thread_rwlock_unlock(context->rwlock);
 	switch_mutex_unlock(context->ogg_mutex);
+	switch_thread_rwlock_unlock(context->rwlock);
 	return status;
 }
 
@@ -1150,7 +1223,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opusfile_load)
 	switch_file_interface_t *file_interface;
 	switch_api_interface_t *commands_api_interface;
 	switch_codec_interface_t *codec_interface;
-	int mpf = 10000, spf = 80, bpf = 160, count = 2;
+	int mpf = 10000, spf = 80, bpf = 160, count = 2; /* 10ms @ 8kHz base, 2 of them => 20ms packets */
 	int RATES[] = {8000, 16000, 24000, 48000};
 	int i;
 
@@ -1178,7 +1251,10 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opusfile_load)
 
 	SWITCH_ADD_CODEC(codec_interface, "OPUSSTREAM");
 
-	for (i = 0; i < sizeof(RATES) / sizeof(RATES[0]); i++) {
+	for (i = 0; i < (int)(sizeof(RATES) / sizeof(RATES[0])); i++) {
+		/* samples per packet are per channel; decoded bytes include all channels */
+		int samples_per_packet = spf * count * RATES[i] / 8000;
+		int bytes_per_packet = bpf * count * RATES[i] / 8000;
 // mono
 		switch_core_codec_add_implementation(pool, codec_interface, SWITCH_CODEC_TYPE_AUDIO,
 											 98, 	 /* the IANA code number */ // does not matter
@@ -1186,10 +1262,10 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opusfile_load)
 											 NULL,   /* default fmtp to send (can be overridden by the init function) */
 											 RATES[i], /* samples transferred per second */ // 48000 !
 											 RATES[i], /* actual samples transferred per second */
-											 16 * RATES[i] / 8000, /* bits transferred per second */
+											 16 * RATES[i], /* bits transferred per second (PCM equivalent) */
 											 mpf * count,  /* number of microseconds per frame */
-											 spf * RATES[i] / 8000, /* number of samples per frame */
-											 bpf * RATES[i] / 8000, /* number of bytes per frame decompressed */
+											 samples_per_packet, /* number of samples per frame */
+											 bytes_per_packet, /* number of bytes per frame decompressed */
 											 0,	/* number of bytes per frame compressed */
 											 1, /* number of channels represented */
 											 1,	/* number of frames per network packet */
@@ -1201,10 +1277,10 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opusfile_load)
 											 NULL,   /* default fmtp to send (can be overridden by the init function) */
 											 RATES[i], /* samples transferred per second */
 											 RATES[i], /* actual samples transferred per second */
-											 16 * RATES[i] / 8000 * 2, /* bits transferred per second */
+											 16 * RATES[i] * 2, /* bits transferred per second (PCM equivalent) */
 											 mpf * count,  /* number of microseconds per frame */
-											 spf * RATES[i] / 8000 * 2, /* number of samples per frame */
-											 bpf * RATES[i] / 8000 * 2, /* number of bytes per frame decompressed */
+											 samples_per_packet, /* number of samples per frame (per channel) */
+											 bytes_per_packet * 2, /* number of bytes per frame decompressed */
 											 0,	/* number of bytes per frame compressed */
 											 2, /* number of channels represented */
 											 1,	/* number of frames per network packet */
@@ -1228,4 +1304,3 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opusfile_load)
  * For VIM:
  * vim:set softtabstop=4 shiftwidth=4 tabstop=4 noet:
  */
-

@@ -29,6 +29,7 @@
  *
  */
 #include <switch.h>
+#include <math.h>
 #include <stdlib.h>
 
 #include <test/switch_test.h>
@@ -150,6 +151,96 @@ FST_CORE_BEGIN(".")
 			switch_core_session_rwunlock(session);
 
 			switch_sleep(1000000);
+		}
+		FST_TEST_END()
+
+		FST_TEST_BEGIN(opusfile_write_8khz_duration)
+		{
+			/* a recording made at 8 kHz must last as long as the audio written to it */
+			static char tmp_filename[] = "/tmp/opusfile-8khz-unit_test.opus";
+			switch_file_handle_t fhw = { 0 }, fhr = { 0 };
+			switch_status_t status;
+			int16_t buf[160];
+			int16_t *rbuf;
+			switch_size_t len, total = 0;
+			int i, j;
+
+			status = switch_core_file_open(&fhw, tmp_filename, 1, 8000, SWITCH_FILE_FLAG_WRITE | SWITCH_FILE_DATA_SHORT, NULL);
+			fst_requires(status == SWITCH_STATUS_SUCCESS);
+			for (i = 0; i < 50; i++) { /* 50 x 20 ms = 1 s */
+				for (j = 0; j < 160; j++) buf[j] = (int16_t)(8000 * sin(2 * M_PI * 1000 * (i * 160 + j) / 8000.0));
+				len = 160;
+				fst_check(switch_core_file_write(&fhw, buf, &len) == SWITCH_STATUS_SUCCESS);
+			}
+			fst_check(switch_core_file_close(&fhw) == SWITCH_STATUS_SUCCESS);
+
+			status = switch_core_file_open(&fhr, tmp_filename, 1, 48000, SWITCH_FILE_FLAG_READ | SWITCH_FILE_DATA_SHORT, NULL);
+			fst_requires(status == SWITCH_STATUS_SUCCESS);
+			switch_zmalloc(rbuf, 4800 * sizeof(int16_t));
+			for (;;) {
+				len = 4800;
+				if (switch_core_file_read(&fhr, rbuf, &len) != SWITCH_STATUS_SUCCESS || !len) break;
+				total += len;
+			}
+			switch_safe_free(rbuf);
+			switch_core_file_close(&fhr);
+			printf("8 kHz recording of 1 s reads back as %ld samples at 48 kHz\n", (long)total);
+			fst_check(total > 44000 && total < 52000);
+			unlink(tmp_filename);
+		}
+		FST_TEST_END()
+
+		FST_TEST_BEGIN(opusstream_stereo_roundtrip)
+		{
+			/* OPUSSTREAM at 2 channels: left and right must stay separate, and the stream must flow */
+			switch_codec_t enc = { 0 }, dec = { 0 };
+			switch_codec_settings_t cs = {{ 0 }};
+			int16_t in[960 * 2];
+			unsigned char page[SWITCH_RECOMMENDED_BUFFER_SIZE];
+			uint32_t page_len, out_len, rate = 48000;
+			unsigned int flags = 0;
+			int16_t *out;
+			long out_frames = 0, max_frames = 48000 * 6, zl = 0, zr = 0, k, first_out = -1;
+			double fl, fr;
+			int i, j;
+
+			switch_zmalloc(out, max_frames * 2 * sizeof(int16_t));
+			fst_requires(switch_core_codec_init(&enc, "OPUSSTREAM", "mod_opusfile", NULL, 48000, 20, 2, SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, &cs, fst_pool) == SWITCH_STATUS_SUCCESS);
+			fst_requires(switch_core_codec_init(&dec, "OPUSSTREAM", "mod_opusfile", NULL, 48000, 20, 2, SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, &cs, fst_pool) == SWITCH_STATUS_SUCCESS);
+
+			for (i = 0; i < 250; i++) { /* 5 s: left 1000 Hz, right 2000 Hz */
+				for (j = 0; j < 960; j++) {
+					in[2 * j] = (int16_t)(8000 * sin(2 * M_PI * 1000 * (i * 960 + j) / 48000.0));
+					in[2 * j + 1] = (int16_t)(8000 * sin(2 * M_PI * 2000 * (i * 960 + j) / 48000.0));
+				}
+				page_len = sizeof(page);
+				switch_core_codec_encode(&enc, NULL, in, sizeof(in), 48000, page, &page_len, &rate, &flags);
+				do {
+					out_len = (uint32_t)((max_frames - out_frames) * 2 * sizeof(int16_t));
+					if (out_len > SWITCH_RECOMMENDED_BUFFER_SIZE) out_len = SWITCH_RECOMMENDED_BUFFER_SIZE;
+					if (switch_core_codec_decode(&dec, NULL, page, page_len, 48000, out + out_frames * 2, &out_len, &rate, &flags) != SWITCH_STATUS_SUCCESS) break;
+					if (out_len && first_out < 0) first_out = i;
+					out_frames += out_len / sizeof(int16_t) / 2;
+					page_len = 0;
+				} while (out_len && out_frames < max_frames);
+				switch_sleep(1000);
+			}
+			printf("stereo OPUSSTREAM: first audio out after %ld ms, %ld frames out\n", first_out * 20, out_frames);
+
+			/* frequency of each channel from zero crossings over the middle second of what came out */
+			for (k = out_frames / 2 - 24000 + 1; k > 0 && k < out_frames / 2 + 24000; k++) {
+				zl += (out[2 * k] < 0) != (out[2 * (k - 1)] < 0);
+				zr += (out[2 * k + 1] < 0) != (out[2 * (k - 1) + 1] < 0);
+			}
+			fl = zl / 2.0; fr = zr / 2.0;
+			printf("stereo OPUSSTREAM: left ~%.0f Hz, right ~%.0f Hz\n", fl, fr);
+			fst_check(out_frames >= 48000);
+			fst_check(fl > 900 && fl < 1100);
+			fst_check(fr > 1800 && fr < 2200);
+
+			switch_safe_free(out);
+			switch_core_codec_destroy(&enc);
+			switch_core_codec_destroy(&dec);
 		}
 		FST_TEST_END()
 
