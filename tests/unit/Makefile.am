@@ -7,7 +7,7 @@ noinst_PROGRAMS += switch_stun
 noinst_PROGRAMS += test_tts_format
 noinst_PROGRAMS+= switch_hold switch_sip
 noinst_PROGRAMS += switch_core_media
-noinst_PROGRAMS += switch_stt_bucket
+noinst_PROGRAMS += switch_stt_bucket switch_stt_bucket_sip
 noinst_PROGRAMS += test_mod_verto
 noinst_PROGRAMS += test_mod_event_socket
 noinst_PROGRAMS += switch_timer
@@ -26,6 +26,12 @@ examples = switch_eavesdrop
 if HAVE_FVAD
 AM_CFLAGS += -DSWITCH_HAVE_FVAD
 endif
+
+# the STT bucket tests decode the multichannel Ogg/Opus stream with libopus
+switch_stt_bucket_CFLAGS = $(AM_CFLAGS) $(OPUS_CFLAGS)
+switch_stt_bucket_LDFLAGS = $(AM_LDFLAGS) $(OPUS_LIBS)
+switch_stt_bucket_sip_CFLAGS = $(AM_CFLAGS) $(OPUS_CFLAGS)
+switch_stt_bucket_sip_LDFLAGS = $(AM_LDFLAGS) $(OPUS_LIBS)
 
 TESTS = $(noinst_PROGRAMS)
 

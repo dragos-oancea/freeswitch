@@ -61,3 +61,4 @@ switch_stt_bucket
 switch_stun
 test_mod_event_socket
 test_mod_verto
+switch_stt_bucket_sip

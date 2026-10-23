@@ -1,0 +1,118 @@
+<?xml version="1.0"?>
+<document type="freeswitch/xml">
+  <!-- two SIP profiles on loopback calling each other; ports picked not to collide with the other test configs -->
+  <X-PRE-PROCESS cmd="set" data="stt_test_ip=127.0.0.1"/>
+  <section name="configuration" description="Various Configuration">
+    <configuration name="modules.conf" description="Modules">
+      <modules>
+        <load module="mod_console"/>
+        <load module="mod_loopback"/>
+        <load module="mod_sofia"/>
+        <load module="mod_commands"/>
+        <load module="mod_dptools"/>
+        <load module="mod_dialplan_xml"/>
+        <load module="mod_tone_stream"/>
+        <load module="mod_sndfile"/>
+        <load module="mod_opus"/>
+      </modules>
+    </configuration>
+
+    <configuration name="switch.conf" description="Core Configuration">
+      <settings>
+        <param name="loglevel" value="info"/>
+        <param name="rtp-start-port" value="31000"/>
+        <param name="rtp-end-port" value="31200"/>
+      </settings>
+    </configuration>
+
+    <configuration name="console.conf" description="Console Logger">
+      <mappings>
+        <map name="all" value="console,debug,info,notice,warning,err,crit,alert"/>
+      </mappings>
+      <settings>
+        <param name="colorize" value="false"/>
+        <param name="loglevel" value="info"/>
+      </settings>
+    </configuration>
+
+    <configuration name="stt_bucket.conf" description="Multichannel Ogg/Opus STT bucket">
+      <settings>
+        <param name="enabled" value="true"/>
+        <param name="channels" value="8"/>
+        <param name="max-buckets" value="1"/>
+        <param name="rate" value="16000"/>
+        <param name="sink" value="file"/>
+        <param name="file-path" value="/tmp/stt_bucket_sip_%s.opus"/>
+        <param name="quarantine-ms" value="300"/>
+        <param name="idle-timeout-ms" value="500"/>
+        <param name="page-ms" value="100"/>
+      </settings>
+    </configuration>
+
+    <configuration name="sofia.conf" description="SofiaSIP">
+      <global_settings>
+        <param name="log-level" value="0"/>
+      </global_settings>
+      <profiles>
+        <profile name="stt_a">
+          <settings>
+            <param name="context" value="stt_test"/>
+            <param name="dialplan" value="XML"/>
+            <param name="sip-ip" value="$${stt_test_ip}"/>
+            <param name="rtp-ip" value="$${stt_test_ip}"/>
+            <param name="ext-sip-ip" value="$${stt_test_ip}"/>
+            <param name="ext-rtp-ip" value="$${stt_test_ip}"/>
+            <param name="sip-port" value="62180"/>
+            <param name="auth-calls" value="false"/>
+            <param name="inbound-codec-prefs" value="PCMU,OPUS"/>
+            <param name="outbound-codec-prefs" value="PCMU,OPUS"/>
+            <param name="rtp-timer-name" value="soft"/>
+          </settings>
+        </profile>
+        <profile name="stt_b">
+          <settings>
+            <param name="context" value="stt_test"/>
+            <param name="dialplan" value="XML"/>
+            <param name="sip-ip" value="$${stt_test_ip}"/>
+            <param name="rtp-ip" value="$${stt_test_ip}"/>
+            <param name="ext-sip-ip" value="$${stt_test_ip}"/>
+            <param name="ext-rtp-ip" value="$${stt_test_ip}"/>
+            <param name="sip-port" value="62181"/>
+            <param name="auth-calls" value="false"/>
+            <param name="inbound-codec-prefs" value="PCMU,OPUS"/>
+            <param name="outbound-codec-prefs" value="PCMU,OPUS"/>
+            <param name="rtp-timer-name" value="soft"/>
+          </settings>
+        </profile>
+      </profiles>
+    </configuration>
+  </section>
+
+  <section name="dialplan" description="Regex/XML Dialplan">
+    <context name="stt_test">
+      <!-- tone<Hz>: joins the bucket explicitly -->
+      <extension name="tone">
+        <condition field="destination_number" expression="^tone(\d+)$">
+          <action application="set" data="stt_bucket=true"/>
+          <action application="answer"/>
+          <action application="endless_playback" data="tone_stream://%(1000,0,$1)"/>
+        </condition>
+      </extension>
+      <!-- plain<Hz>: says nothing, joins only when attach-all is on -->
+      <extension name="plain">
+        <condition field="destination_number" expression="^plain(\d+)$">
+          <action application="answer"/>
+          <action application="endless_playback" data="tone_stream://%(1000,0,$1)"/>
+        </condition>
+      </extension>
+      <!-- optout<Hz>: refuses the bucket even with attach-all -->
+      <extension name="optout">
+        <condition field="destination_number" expression="^optout(\d+)$">
+          <action application="set" data="stt_bucket=false"/>
+          <action application="answer"/>
+          <action application="endless_playback" data="tone_stream://%(1000,0,$1)"/>
+        </condition>
+      </extension>
+    </context>
+  </section>
+</document>
