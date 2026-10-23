@@ -60,6 +60,7 @@ typedef enum {
 
 typedef struct {
 	char uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char peer_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
 	char stream_id[STT_BUCKET_STREAM_ID_LEN];
 	uint64_t start_ms;
 	uint64_t end_ms; /* UINT64_MAX while open */
@@ -72,6 +73,7 @@ struct switch_stt_bucket_slot_s {
 	slot_state_t state;
 	uint32_t generation;
 	char uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char peer_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
 	switch_buffer_t *buf;
 	switch_bool_t primed;
 	switch_time_t free_at;
@@ -148,6 +150,9 @@ static void fire_slot_event(const char *subclass, switch_stt_bucket_t *b, switch
 		return;
 	}
 	switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Unique-ID", h->uuid);
+	if (*h->peer_uuid) {
+		switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "STT-Peer-UUID", h->peer_uuid);
+	}
 	switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "STT-Bucket", b->name);
 	switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "STT-Stream-ID", h->stream_id);
 	switch_event_add_header(event, SWITCH_STACK_BOTTOM, "STT-Channel", "%d", slot->index);
@@ -183,6 +188,7 @@ static slot_history_t *history_open(switch_stt_bucket_slot_t *slot, const char *
 	slot->history_pos = (slot->history_pos + 1) % STT_BUCKET_HISTORY;
 	h = &slot->history[slot->history_pos];
 	switch_copy_string(h->uuid, slot->uuid, sizeof(h->uuid));
+	switch_copy_string(h->peer_uuid, slot->peer_uuid, sizeof(h->peer_uuid));
 	switch_copy_string(h->stream_id, stream_id, sizeof(h->stream_id));
 	h->start_ms = start_ms;
 	h->end_ms = UINT64_MAX;
@@ -532,6 +538,7 @@ static int bucket_tick(switch_stt_bucket_t *b, uint32_t frame, int page_due, int
 				slot->free_at = now + (switch_time_t)quarantine_ms * 1000;
 				slot->announced_epoch = 0;
 				*slot->uuid = '\0';
+				*slot->peer_uuid = '\0';
 			}
 		} else if (slot->state == SLOT_QUARANTINE && now >= slot->free_at) {
 			slot->state = SLOT_FREE;
@@ -714,7 +721,17 @@ SWITCH_DECLARE(switch_bool_t) switch_stt_bucket_attach_all(void)
 	return globals.cfg.attach_all;
 }
 
+SWITCH_DECLARE(switch_bool_t) switch_stt_bucket_follow_bridge(void)
+{
+	return globals.cfg.follow_bridge;
+}
+
 SWITCH_DECLARE(switch_status_t) switch_stt_bucket_attach(const char *uuid, switch_stt_bucket_slot_t **slotp, uint32_t *generation)
+{
+	return switch_stt_bucket_attach_peer(uuid, NULL, slotp, generation);
+}
+
+SWITCH_DECLARE(switch_status_t) switch_stt_bucket_attach_peer(const char *uuid, const char *peer_uuid, switch_stt_bucket_slot_t **slotp, uint32_t *generation)
 {
 	switch_stt_bucket_config_t cfg;
 	switch_stt_bucket_slot_t *found = NULL;
@@ -751,6 +768,7 @@ SWITCH_DECLARE(switch_status_t) switch_stt_bucket_attach(const char *uuid, switc
 				slot->underruns = slot->dropped_ms = 0;
 				slot->announced_epoch = 0;
 				switch_copy_string(slot->uuid, uuid, sizeof(slot->uuid));
+				switch_copy_string(slot->peer_uuid, switch_str_nil(peer_uuid), sizeof(slot->peer_uuid));
 				switch_buffer_zero(slot->buf);
 				*generation = slot->generation;
 				found = slot;
@@ -1084,6 +1102,7 @@ static void config_defaults(switch_stt_bucket_config_t *cfg)
 	cfg->idle_timeout_ms = 5000;
 	cfg->max_buffer_ms = 500;
 	cfg->attach_all = SWITCH_FALSE;
+	cfg->follow_bridge = SWITCH_TRUE;
 	switch_copy_string(cfg->sink, "file", sizeof(cfg->sink));
 }
 
@@ -1156,6 +1175,7 @@ static void config_load(switch_stt_bucket_config_t *cfg)
 			else if (!strcasecmp(var, "idle-timeout-ms")) cfg->idle_timeout_ms = atoi(val);
 			else if (!strcasecmp(var, "max-buffer-ms")) cfg->max_buffer_ms = atoi(val);
 			else if (!strcasecmp(var, "attach-all")) cfg->attach_all = switch_true(val);
+			else if (!strcasecmp(var, "bridge-legs")) cfg->follow_bridge = switch_true(val);
 			else if (!strcasecmp(var, "dtx")) cfg->dtx = switch_true(val);
 			else if (!strcasecmp(var, "sink")) switch_copy_string(cfg->sink, val, sizeof(cfg->sink));
 			else if (!strcasecmp(var, "file-path")) switch_copy_string(cfg->file_path, val, sizeof(cfg->file_path));

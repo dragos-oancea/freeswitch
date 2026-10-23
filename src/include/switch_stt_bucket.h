@@ -88,6 +88,8 @@ typedef struct switch_stt_bucket_config_s {
 	char file_path[512];
 	/*! tcp sink: host:port */
 	char tcp_target[256];
+	/*! an outbound leg (e.g. the B-leg of a bridge) joins when the call that originated it has stt_bucket=true */
+	switch_bool_t follow_bridge;
 } switch_stt_bucket_config_t;
 
 /*! load stt_bucket.conf (called from switch_core_init) */
@@ -103,6 +105,8 @@ SWITCH_DECLARE(void) switch_stt_bucket_unregister_sink(const char *name);
 
 /*! claim a channel for a call; fires SWITCH_STT_BUCKET_EVENT_ATTACH */
 SWITCH_DECLARE(switch_status_t) switch_stt_bucket_attach(const char *uuid, switch_stt_bucket_slot_t **slot, uint32_t *generation);
+/*! same, recording the other leg of the call (bridge partner / originator): events carry it as STT-Peer-UUID */
+SWITCH_DECLARE(switch_status_t) switch_stt_bucket_attach_peer(const char *uuid, const char *peer_uuid, switch_stt_bucket_slot_t **slot, uint32_t *generation);
 /*! release it; buffered audio is still flushed; fires SWITCH_STT_BUCKET_EVENT_DETACH */
 SWITCH_DECLARE(void) switch_stt_bucket_detach(switch_stt_bucket_slot_t *slot, uint32_t generation);
 
@@ -117,6 +121,7 @@ SWITCH_DECLARE(switch_status_t) switch_stt_bucket_feed_pcm(switch_stt_bucket_slo
 SWITCH_DECLARE(void) switch_stt_bucket_slot_info(switch_stt_bucket_slot_t *slot, const char **bucket_name, int *channel);
 SWITCH_DECLARE(switch_bool_t) switch_stt_bucket_enabled(void);
 SWITCH_DECLARE(switch_bool_t) switch_stt_bucket_attach_all(void);
+SWITCH_DECLARE(switch_bool_t) switch_stt_bucket_follow_bridge(void);
 
 /*! which call was on channel `channel` of stream `stream_id` at `offset_ms` (stream time)? */
 SWITCH_DECLARE(switch_status_t) switch_stt_bucket_resolve(const char *stream_id, int channel, uint64_t offset_ms, char *uuid, switch_size_t uuid_len);

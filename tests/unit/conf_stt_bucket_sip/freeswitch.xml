@@ -113,6 +113,23 @@
           <action application="endless_playback" data="tone_stream://%(1000,0,$1)"/>
         </condition>
       </extension>
+      <!-- bridge<Hz>: a PBX call. This leg (the A-leg) joins the bucket and bridges to a phone on the
+           other profile that answers with <Hz>; the B-leg joins by following the A-leg -->
+      <extension name="bridge">
+        <condition field="destination_number" expression="^bridge(\d+)$">
+          <action application="set" data="stt_bucket=true"/>
+          <action application="set" data="absolute_codec_string=PCMU"/>
+          <action application="bridge" data="sofia/stt_b/callee$1@$${stt_test_ip}:62180"/>
+        </condition>
+      </extension>
+      <!-- callee<Hz>: the far phone of a bridged call; not part of the PBX, so it stays out -->
+      <extension name="callee">
+        <condition field="destination_number" expression="^callee(\d+)$">
+          <action application="set" data="stt_bucket=false"/>
+          <action application="answer"/>
+          <action application="endless_playback" data="tone_stream://%(1000,0,$1)"/>
+        </condition>
+      </extension>
     </context>
   </section>
 </document>

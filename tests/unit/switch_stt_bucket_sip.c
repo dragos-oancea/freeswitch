@@ -29,10 +29,14 @@
 
 typedef struct {
 	char uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char peer[SWITCH_UUID_FORMATTED_LENGTH + 1];
 	char stream_id[128];
 	int channel;
 	long start_ms, end_ms;
 	int attached, detached;
+	/* the first time on the bucket, kept when the leg leaves and joins again */
+	int first_channel;
+	long first_start_ms, first_end_ms;
 } leg_rec_t;
 
 static leg_rec_t legs[MAX_LEGS];
@@ -66,11 +70,17 @@ static void stt_event_cb(switch_event_t *event)
 		l->attached++;
 		l->channel = atoi(switch_event_get_header_nil(event, "STT-Channel"));
 		l->start_ms = atol(switch_event_get_header_nil(event, "STT-Start-Ms"));
+		switch_copy_string(l->peer, switch_event_get_header_nil(event, "STT-Peer-UUID"), sizeof(l->peer));
+		if (l->attached == 1) {
+			l->first_channel = l->channel;
+			l->first_start_ms = l->start_ms;
+		}
 		switch_copy_string(l->stream_id, switch_event_get_header_nil(event, "STT-Stream-ID"), sizeof(l->stream_id));
 	} else if (uuid && !strcmp(sub, SWITCH_STT_BUCKET_EVENT_DETACH) && (l = leg_by_uuid(uuid, 1))) {
 		const char *end = switch_event_get_header(event, "STT-End-Ms");
 		l->detached++;
 		l->end_ms = end ? atol(end) : -1;
+		if (l->detached == 1) l->first_end_ms = l->end_ms;
 	}
 	switch_mutex_unlock(ev_mutex);
 }
@@ -141,6 +151,23 @@ static const char *leg_var(const char *uuid, const char *var, char *buf, switch_
 		switch_core_session_rwunlock(s);
 	}
 	return buf;
+}
+
+static int legs_with(int attached, int detached)
+{
+	int i, n = 0;
+	switch_mutex_lock(ev_mutex);
+	for (i = 0; i < nlegs; i++) n += legs[i].attached == attached && legs[i].detached == detached;
+	switch_mutex_unlock(ev_mutex);
+	return n;
+}
+
+static void api(const char *cmd, const char *args)
+{
+	switch_stream_handle_t stream = { 0 };
+	SWITCH_STANDARD_STREAM(stream);
+	switch_api_execute(cmd, args, NULL, &stream);
+	switch_safe_free(stream.data);
 }
 
 static void kill_call(const char *uuid)
@@ -278,6 +305,103 @@ FST_CORE_BEGIN("./conf_stt_bucket_sip")
 				if (!used) fst_check(channel_rms(&d, i, 0, d.frames) < 50);
 			}
 			decoded_free(&d);
+		}
+		FST_TEST_END()
+
+		FST_TEST_BEGIN(bridged_call_both_legs)
+		{
+			/* A phone calls the PBX (extension bridge900); the dialplan sets stt_bucket=true and bridges to
+			   another phone. The PBX's two legs must land on two channels: the A-leg carrying what the caller
+			   says (700 Hz), the B-leg what the callee says (900 Hz). The phones themselves stay out. */
+			char caller[64], a_leg[64] = "", b_leg[64] = "", buf[64], uuid[64];
+			leg_rec_t *a = NULL, *b = NULL;
+			decoded_t d;
+			int i;
+
+			use_mock_sink(SWITCH_FALSE);
+			fst_requires(place_call("stt_bucket=false,absolute_codec_string=PCMU", "stt_a", 62181, "bridge900", 700, caller, sizeof(caller)) == SWITCH_STATUS_SUCCESS);
+
+			fst_wait_until(nlegs >= 2, 5000);
+			switch_sleep(300000);
+			fst_requires(nlegs == 2);
+
+			/* the B-leg is the one the A-leg originated */
+			for (i = 0; i < 2; i++) {
+				char orig[64];
+				if (!zstr(leg_var(legs[i].uuid, "originator", orig, sizeof(orig))) && !strcmp(orig, legs[!i].uuid)) {
+					b = &legs[i];
+					a = &legs[!i];
+				}
+			}
+			fst_requires(a && b);
+			switch_copy_string(a_leg, a->uuid, sizeof(a_leg));
+			switch_copy_string(b_leg, b->uuid, sizeof(b_leg));
+			fst_check(strcmp(a_leg, caller) != 0);
+			fst_check(strcmp(b_leg, caller) != 0);
+
+			/* the B-leg joined without the variable of its own, and its event pairs it with the A-leg */
+			fst_check(zstr(leg_var(b_leg, "stt_bucket", buf, sizeof(buf))));
+			fst_check_string_equals(b->peer, a_leg);
+			fst_check(zstr(a->peer) || !strcmp(a->peer, b_leg));
+			fst_check(a->channel != b->channel);
+
+			switch_sleep(2000000);
+
+			/* turning STT off for the conversation mid-call takes both legs out; the call goes on */
+			{
+				char *args = switch_mprintf("%s stt_bucket false", a_leg);
+				api("uuid_setvar", args);
+				switch_safe_free(args);
+			}
+			fst_wait_until(legs_with(1, 1) == 2, 3000);
+			fst_check_int_equals(legs_with(1, 1), 2);
+			fst_check(!zstr(leg_var(a_leg, "read_codec", buf, sizeof(buf)))); /* still up */
+			fst_check(zstr(leg_var(a_leg, "stt_bucket_channel", buf, sizeof(buf))));
+			fst_check(zstr(leg_var(b_leg, "stt_bucket_channel", buf, sizeof(buf))));
+
+			/* and back on: both join again */
+			{
+				char *args = switch_mprintf("%s stt_bucket true", a_leg);
+				api("uuid_setvar", args);
+				switch_safe_free(args);
+			}
+			fst_wait_until(legs_with(2, 1) == 2, 3000);
+			fst_check_int_equals(legs_with(2, 1), 2);
+			fst_check_string_equals(b->peer, a_leg);
+			switch_sleep(1000000);
+
+			kill_call(caller);
+			fst_wait_until(legs_with(2, 2) == 2, 5000);
+			fst_check_int_equals(legs_with(2, 2), 2);
+			fst_check_int_equals(nlegs, 2); /* the two phones never joined */
+			fst_wait_until(stream_closes >= 1, 5000);
+			fst_requires(stream_closes >= 1);
+
+			fst_requires(mock.nstreams == 1);
+			fst_requires(decode_ogg_opus(switch_buffer_get_head_pointer(mock.streams[0].data), switch_buffer_inuse(mock.streams[0].data), &d) == 0);
+			{
+				struct { leg_rec_t *l; int expect; const char *name; } check[2] = { { a, 700, "A-leg" }, { b, 900, "B-leg" } };
+				for (i = 0; i < 2; i++) {
+					leg_rec_t *l = check[i].l;
+					long mid = l->first_start_ms + (l->first_end_ms - l->first_start_ms) / 2;
+					double got;
+
+					printf("%s ch %d: %ld..%ld ms, then ch %d from %ld ms\n", check[i].name, l->first_channel, l->first_start_ms, l->first_end_ms,
+						   l->channel, l->start_ms);
+					fst_check(l->first_end_ms > l->first_start_ms + 1500);
+					got = dominant_tone(&d, l->first_channel, (mid - 500) * 48, 48000, TONES, (int)(sizeof(TONES) / sizeof(TONES[0])));
+					printf("%s: expect %d Hz, got %.0f Hz\n", check[i].name, check[i].expect, got);
+					fst_check_int_equals((int)got, check[i].expect);
+					fst_check(switch_stt_bucket_resolve(l->stream_id, l->first_channel, (uint64_t)mid, uuid, sizeof(uuid)) == SWITCH_STATUS_SUCCESS);
+					fst_check_string_equals(uuid, l->uuid);
+
+					/* the second stay carries the same side of the conversation */
+					got = dominant_tone(&d, l->channel, (l->start_ms + 200) * 48, 48000 / 2, TONES, (int)(sizeof(TONES) / sizeof(TONES[0])));
+					fst_check_int_equals((int)got, check[i].expect);
+				}
+			}
+			decoded_free(&d);
+			fst_wait_until(switch_core_session_count() == 0, 5000);
 		}
 		FST_TEST_END()
 

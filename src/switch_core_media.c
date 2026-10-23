@@ -275,7 +275,7 @@ struct switch_media_handle_s {
 	/* STT bucket: this call's channel in a shared multichannel Ogg/Opus stream */
 	switch_stt_bucket_slot_t *stt_slot;
 	uint32_t stt_generation;
-	switch_bool_t stt_checked;
+	int stt_check_in; /* frames until stt_bucket / the bridge are looked at again */
 
 };
 
@@ -2780,31 +2780,69 @@ static void check_media_timeout_params(switch_core_session_t *session, switch_rt
 	}
 }
 
+/* Does this call belong in the STT bucket right now?
+   - stt_bucket=true / false on the channel decides (it can be changed during the call, e.g. uuid_setvar);
+   - otherwise attach-all decides;
+   - otherwise, with bridge-legs on, an outbound leg follows the call that originated it (the B-leg of a bridge). */
+static switch_bool_t stt_bucket_wanted(switch_core_session_t *session, char *peer, switch_size_t peer_len)
+{
+	const char *var = switch_channel_get_variable(session->channel, "stt_bucket");
+	const char *orig = switch_channel_get_variable(session->channel, SWITCH_ORIGINATOR_VARIABLE);
+	switch_bool_t wanted = SWITCH_FALSE;
+
+	*peer = '\0';
+	if (!zstr(orig)) {
+		switch_copy_string(peer, orig, peer_len);
+	} else {
+		switch_channel_get_partner_uuid_copy(session->channel, peer, peer_len);
+	}
+
+	if (!zstr(var)) {
+		return switch_true(var);
+	}
+	if (switch_stt_bucket_attach_all()) {
+		return SWITCH_TRUE;
+	}
+	if (!zstr(orig) && switch_stt_bucket_follow_bridge()) {
+		switch_core_session_t *osession = switch_core_session_locate(orig);
+
+		if (osession) {
+			wanted = switch_true(switch_channel_get_variable(switch_core_session_get_channel(osession), "stt_bucket"));
+			switch_core_session_rwunlock(osession);
+		}
+	}
+	return wanted;
+}
+
 /* STT bucket tap: hand the inbound RTP payload of this call to its channel in the shared stream.
-   Runs on the call's read thread, right where the frame leaves the RTP stack; no media bug involved. */
+   Runs on the call's read thread, right where the frame leaves the RTP stack; no media bug involved.
+   Whether the call belongs in the bucket is looked at on the first frame and then about every
+   half second, so a call can join or leave mid-call and a bridged leg can follow its originator. */
+#define STT_BUCKET_RECHECK_FRAMES 25
+
 static void stt_bucket_tap(switch_core_session_t *session, switch_media_handle_t *smh, switch_rtp_engine_t *engine, switch_frame_t *frame)
 {
-	if (!smh->stt_checked) {
-		const char *var;
+	if (smh->stt_check_in-- <= 0) {
+		char peer[SWITCH_UUID_FORMATTED_LENGTH + 1];
+		switch_bool_t wanted;
 
-		smh->stt_checked = SWITCH_TRUE;
+		smh->stt_check_in = STT_BUCKET_RECHECK_FRAMES;
+		wanted = switch_stt_bucket_enabled() && stt_bucket_wanted(session, peer, sizeof(peer));
 
-		if (!switch_stt_bucket_enabled()) {
-			return;
-		}
+		if (wanted && !smh->stt_slot) {
+			if (switch_stt_bucket_attach_peer(switch_core_session_get_uuid(session), peer, &smh->stt_slot, &smh->stt_generation) == SWITCH_STATUS_SUCCESS) {
+				const char *bucket_name = NULL;
+				int channel = -1;
 
-		var = switch_channel_get_variable(session->channel, "stt_bucket");
-		if (!(switch_true(var) || (switch_stt_bucket_attach_all() && !switch_false(var)))) {
-			return;
-		}
-
-		if (switch_stt_bucket_attach(switch_core_session_get_uuid(session), &smh->stt_slot, &smh->stt_generation) == SWITCH_STATUS_SUCCESS) {
-			const char *bucket_name = NULL;
-			int channel = -1;
-
-			switch_stt_bucket_slot_info(smh->stt_slot, &bucket_name, &channel);
-			switch_channel_set_variable(session->channel, "stt_bucket_name", bucket_name);
-			switch_channel_set_variable_printf(session->channel, "stt_bucket_channel", "%d", channel);
+				switch_stt_bucket_slot_info(smh->stt_slot, &bucket_name, &channel);
+				switch_channel_set_variable(session->channel, "stt_bucket_name", bucket_name);
+				switch_channel_set_variable_printf(session->channel, "stt_bucket_channel", "%d", channel);
+			}
+		} else if (!wanted && smh->stt_slot) {
+			switch_stt_bucket_detach(smh->stt_slot, smh->stt_generation);
+			smh->stt_slot = NULL;
+			switch_channel_set_variable(session->channel, "stt_bucket_name", NULL);
+			switch_channel_set_variable(session->channel, "stt_bucket_channel", NULL);
 		}
 	}
 

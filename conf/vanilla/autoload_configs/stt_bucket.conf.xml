@@ -2,8 +2,16 @@
   STT bucket: the inbound audio of many calls is multiplexed into the channels of one
   Ogg/Opus stream (mapping family 255) and sent over one connection to an STT provider.
 
-  A call joins when its channel variable stt_bucket=true is set before media starts
-  (or every call when attach-all=true; stt_bucket=false opts a call out).
+  A call joins when its channel variable stt_bucket=true is set (or every call when
+  attach-all=true; stt_bucket=false opts a call out). The variable is looked at on the first
+  audio frame and then about every half second, so it can be set from the dialplan before or
+  after answer, or changed mid-call (uuid_setvar <uuid> stt_bucket true|false).
+  With bridge-legs=true the outbound leg of a bridge follows the call that originated it, so
+    <action application="set" data="stt_bucket=true"/>
+    <action application="bridge" data="sofia/gateway/..."/>
+  puts both sides of the conversation in the bucket, each on its own channel; the B-leg's
+  attach event carries STT-Peer-UUID (the A-leg) to pair the two channels.
+  Calls with bypass-media/proxy-media send no audio through FreeSWITCH and cannot join.
   The call gets stt_bucket_name / stt_bucket_channel variables, and the events
   stt_bucket::attach / stt_bucket::detach / stt_bucket::stream carry the stream id,
   channel and start/end offsets used to route per-channel results back to calls.
@@ -29,6 +37,8 @@
     <!-- smaller stream, but ffmpeg's family-255 decoder bleeds audio across channels with it -->
     <param name="dtx" value="false"/>
     <param name="attach-all" value="false"/>
+    <!-- the B-leg of a bridge joins (and leaves) with the A-leg -->
+    <param name="bridge-legs" value="true"/>
     <!-- file | tcp | a sink registered by a module (e.g. your provider's websocket client) -->
     <param name="sink" value="file"/>
     <param name="file-path" value="$${recordings_dir}/stt_bucket_%s.opus"/>
