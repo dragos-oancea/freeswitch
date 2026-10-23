@@ -73,6 +73,7 @@ endpoints/mod_rtc
 endpoints/mod_skinny
 endpoints/mod_sofia
 endpoints/mod_verto
+#endpoints/mod_wsbridge
 #event_handlers/mod_amqp
 event_handlers/mod_cdr_csv
 #event_handlers/mod_cdr_pg_csv

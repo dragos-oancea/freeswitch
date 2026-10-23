@@ -1649,6 +1649,10 @@ PKG_CHECK_MODULES([HIREDIS], [hiredis >= 0.10.0],[
   AM_CONDITIONAL([HAVE_HIREDIS],[true])],[
   AC_MSG_RESULT([no]); AM_CONDITIONAL([HAVE_HIREDIS],[false])])
 
+PKG_CHECK_MODULES([WEBSOCKETS], [libwebsockets >= 2.4],[
+  AM_CONDITIONAL([HAVE_WEBSOCKETS],[true])],[
+  AC_MSG_RESULT([no]); AM_CONDITIONAL([HAVE_WEBSOCKETS],[false])])
+
 AC_ARG_ENABLE(core-libedit-support,     
   [AS_HELP_STRING([--disable-core-libedit-support], [Compile without libedit Support])])
 
@@ -2115,6 +2119,7 @@ AC_CONFIG_FILES([Makefile
 		src/mod/endpoints/mod_sofia/Makefile
 		src/mod/endpoints/mod_rtc/Makefile
 		src/mod/endpoints/mod_verto/Makefile
+		src/mod/endpoints/mod_wsbridge/Makefile
 		src/mod/event_handlers/mod_amqp/Makefile
 		src/mod/event_handlers/mod_cdr_csv/Makefile
 		src/mod/event_handlers/mod_cdr_pg_csv/Makefile
