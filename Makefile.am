@@ -244,6 +244,12 @@ if HAVE_ODBC
 libfreeswitch_la_LDFLAGS += $(ODBC_LIB_FLAGS)
 endif
 
+# multichannel Ogg/Opus STT bucket (src/switch_core_stt_bucket.c) needs libopusenc
+if HAVE_OPUSFILE_ENCODE
+libfreeswitch_la_CFLAGS += $(OPUSFILE_ENCODE_CFLAGS) -DHAVE_LIBOPUSENC
+libfreeswitch_la_LIBADD += $(OPUSFILE_ENCODE_LIBS)
+endif
+
 library_includetestdir = $(includedir)/test
 library_includetest_HEADERS = \
 	src/include/test/switch_fct.h \
@@ -262,6 +268,7 @@ library_include_HEADERS = \
 	src/include/switch_scheduler.h \
 	src/include/switch_core.h \
 	src/include/switch_core_media.h \
+	src/include/switch_stt_bucket.h \
 	src/include/switch_core_video.h \
 	src/include/switch_core_db.h \
 	src/include/switch_mprintf.h \
@@ -337,6 +344,7 @@ libfreeswitch_la_SOURCES = \
 	src/switch_core.c \
 	src/switch_version.c \
 	src/switch_core_media.c \
+	src/switch_core_stt_bucket.c \
 	src/switch_core_video.c \
 	src/switch_packetizer.c \
 	src/switch_sdp.c \

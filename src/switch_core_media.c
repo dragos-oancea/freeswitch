@@ -272,6 +272,11 @@ struct switch_media_handle_s {
 
 	switch_time_t last_text_frame;
 
+	/* STT bucket: this call's channel in a shared multichannel Ogg/Opus stream */
+	switch_stt_bucket_slot_t *stt_slot;
+	uint32_t stt_generation;
+	switch_bool_t stt_checked;
+
 };
 
 switch_srtp_crypto_suite_t SUITES[CRYPTO_INVALID] = {
@@ -2775,6 +2780,47 @@ static void check_media_timeout_params(switch_core_session_t *session, switch_rt
 	}
 }
 
+/* STT bucket tap: hand the inbound RTP payload of this call to its channel in the shared stream.
+   Runs on the call's read thread, right where the frame leaves the RTP stack; no media bug involved. */
+static void stt_bucket_tap(switch_core_session_t *session, switch_media_handle_t *smh, switch_rtp_engine_t *engine, switch_frame_t *frame)
+{
+	if (!smh->stt_checked) {
+		const char *var;
+
+		smh->stt_checked = SWITCH_TRUE;
+
+		if (!switch_stt_bucket_enabled()) {
+			return;
+		}
+
+		var = switch_channel_get_variable(session->channel, "stt_bucket");
+		if (!(switch_true(var) || (switch_stt_bucket_attach_all() && !switch_false(var)))) {
+			return;
+		}
+
+		if (switch_stt_bucket_attach(switch_core_session_get_uuid(session), &smh->stt_slot, &smh->stt_generation) == SWITCH_STATUS_SUCCESS) {
+			const char *bucket_name = NULL;
+			int channel = -1;
+
+			switch_stt_bucket_slot_info(smh->stt_slot, &bucket_name, &channel);
+			switch_channel_set_variable(session->channel, "stt_bucket_name", bucket_name);
+			switch_channel_set_variable_printf(session->channel, "stt_bucket_channel", "%d", channel);
+		}
+	}
+
+	if (smh->stt_slot && frame) {
+		switch_stt_bucket_feed_frame(smh->stt_slot, smh->stt_generation, &engine->read_impl, engine->read_codec.fmtp_in, frame);
+	}
+}
+
+static void stt_bucket_untap(switch_media_handle_t *smh)
+{
+	if (smh->stt_slot) {
+		switch_stt_bucket_detach(smh->stt_slot, smh->stt_generation);
+		smh->stt_slot = NULL;
+	}
+}
+
 SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session_t *session, switch_frame_t **frame,
 															 switch_io_flag_t flags, int stream_id, switch_media_type_t type)
 {
@@ -3307,6 +3353,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session
 
 	} else {
 		*frame = &engine->read_frame;
+
+		if (type == SWITCH_MEDIA_TYPE_AUDIO && *frame) {
+			stt_bucket_tap(session, smh, engine, *frame);
+		}
 	}
 
 	status = SWITCH_STATUS_SUCCESS;
@@ -8299,6 +8349,9 @@ SWITCH_DECLARE(void) switch_core_media_deactivate_rtp(switch_core_session_t *ses
 	if (!(smh = session->media_handle)) {
 		return;
 	}
+
+	/* the call's channel goes back to the bucket (after its buffered audio is sent and a quarantine) */
+	stt_bucket_untap(smh);
 
 	a_engine = &smh->engines[SWITCH_MEDIA_TYPE_AUDIO];
 	v_engine = &smh->engines[SWITCH_MEDIA_TYPE_VIDEO];

@@ -1,0 +1,37 @@
+<!--
+  STT bucket: the inbound audio of many calls is multiplexed into the channels of one
+  Ogg/Opus stream (mapping family 255) and sent over one connection to an STT provider.
+
+  A call joins when its channel variable stt_bucket=true is set before media starts
+  (or every call when attach-all=true; stt_bucket=false opts a call out).
+  The call gets stt_bucket_name / stt_bucket_channel variables, and the events
+  stt_bucket::attach / stt_bucket::detach / stt_bucket::stream carry the stream id,
+  channel and start/end offsets used to route per-channel results back to calls.
+  fs_cli: "stt_bucket status", "stt_bucket resolve <stream_id> <channel> <offset_ms>".
+-->
+<configuration name="stt_bucket.conf" description="Multichannel Ogg/Opus STT bucket">
+  <settings>
+    <param name="enabled" value="false"/>
+    <!-- calls per stream (1..255) and streams (= provider connections) -->
+    <param name="channels" value="255"/>
+    <param name="max-buckets" value="4"/>
+    <!-- 8000 | 12000 | 16000 | 24000 | 48000 -->
+    <param name="rate" value="16000"/>
+    <param name="ptime" value="20"/>
+    <param name="bitrate-per-channel" value="16000"/>
+    <!-- force an Ogg page out this often (latency vs. overhead) -->
+    <param name="page-ms" value="100"/>
+    <!-- a freed channel stays silent this long before another call may take it -->
+    <param name="quarantine-ms" value="2000"/>
+    <!-- close the provider stream when no call has been in the bucket this long -->
+    <param name="idle-timeout-ms" value="5000"/>
+    <param name="max-buffer-ms" value="500"/>
+    <!-- smaller stream, but ffmpeg's family-255 decoder bleeds audio across channels with it -->
+    <param name="dtx" value="false"/>
+    <param name="attach-all" value="false"/>
+    <!-- file | tcp | a sink registered by a module (e.g. your provider's websocket client) -->
+    <param name="sink" value="file"/>
+    <param name="file-path" value="$${recordings_dir}/stt_bucket_%s.opus"/>
+    <param name="tcp-target" value="127.0.0.1:9099"/>
+  </settings>
+</configuration>

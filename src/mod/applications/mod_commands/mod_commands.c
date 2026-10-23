@@ -6685,6 +6685,34 @@ SWITCH_STANDARD_API(interface_allowlist_dump_function)
 	return SWITCH_STATUS_SUCCESS;
 }
 
+#define STT_BUCKET_SYNTAX "status | resolve <stream_id> <channel> <offset_ms>"
+SWITCH_STANDARD_API(stt_bucket_api_function)
+{
+	char *mydata = NULL, *argv[4] = { 0 };
+	int argc = 0;
+
+	if (!zstr(cmd) && (mydata = strdup(cmd))) {
+		argc = switch_separate_string(mydata, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
+	}
+
+	if (argc == 0 || !strcasecmp(argv[0], "status")) {
+		switch_stt_bucket_status(stream);
+	} else if (!strcasecmp(argv[0], "resolve") && argc == 4) {
+		char uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
+
+		if (switch_stt_bucket_resolve(argv[1], atoi(argv[2]), (uint64_t)strtoull(argv[3], NULL, 10), uuid, sizeof(uuid)) == SWITCH_STATUS_SUCCESS) {
+			stream->write_function(stream, "%s\n", uuid);
+		} else {
+			stream->write_function(stream, "-ERR not found\n");
+		}
+	} else {
+		stream->write_function(stream, "-USAGE: %s\n", STT_BUCKET_SYNTAX);
+	}
+
+	switch_safe_free(mydata);
+	return SWITCH_STATUS_SUCCESS;
+}
+
 SWITCH_STANDARD_API(strftime_tz_api_function)
 {
 	char *format = NULL;
@@ -7708,6 +7736,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_commands_load)
 	SWITCH_ADD_API(commands_api_interface, "show", "Show various reports", show_function, SHOW_SYNTAX);
 	SWITCH_ADD_API(commands_api_interface, "sql_escape", "Escape a string to prevent sql injection", sql_escape, SQL_ESCAPE_SYNTAX);
 	SWITCH_ADD_API(commands_api_interface, "status", "Show current status", status_function, "");
+	SWITCH_ADD_API(commands_api_interface, "stt_bucket", "Multichannel STT bucket status / channel lookup", stt_bucket_api_function, STT_BUCKET_SYNTAX);
 	SWITCH_ADD_API(commands_api_interface, "strftime_tz", "Display formatted time of timezone", strftime_tz_api_function, "<timezone_name> [<epoch>|][format string]");
 	SWITCH_ADD_API(commands_api_interface, "stun", "Execute STUN lookup", stun_function, "<stun_server>[:port] [<source_ip>[:<source_port]]");
 	SWITCH_ADD_API(commands_api_interface, "time_test", "Show time jitter", time_test_function, "<mss> [count]");

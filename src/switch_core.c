@@ -1975,6 +1975,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_init(switch_core_flag_t flags, switc
 	switch_core_state_machine_init(runtime.memory_pool);
 
 	switch_core_media_init();
+	switch_stt_bucket_init(runtime.memory_pool);
 	switch_scheduler_task_thread_start();
 
 	switch_nat_late_init();
@@ -3042,6 +3043,8 @@ SWITCH_DECLARE(switch_status_t) switch_core_destroy(void)
 	switch_core_session_hupall(runtime.shutdown_cause);
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "Clean up modules.\n");
 
+	/* before modules go away: a module may own the sink the buckets write to */
+	switch_stt_bucket_shutdown();
 	switch_loadable_module_shutdown();
 
 	switch_curl_destroy();
