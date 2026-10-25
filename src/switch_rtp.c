@@ -526,6 +526,11 @@ struct switch_rtp {
 	switch_core_session_t *session;
 	payload_map_t **pmaps;
 	payload_map_t *pmap_tail;
+	/* Cache of the negotiated payload map that matched the last received payload type, so the
+	   per-packet lookups below don't re-walk the list under flag_mutex for every packet (and
+	   several times per packet). Keyed by recv_pmap_pt; invalidated when pmaps is replaced. */
+	payload_map_t *recv_pmap;
+	switch_payload_t recv_pmap_pt;
 	kalman_estimator_t *estimators[KALMAN_SYSTEM_MODELS];
 	cusum_kalman_detector_t *detectors[KALMAN_SYSTEM_MODELS];
 	switch_time_t last_adj;
@@ -2731,6 +2736,7 @@ SWITCH_DECLARE(switch_status_t) switch_rtp_set_payload_map(switch_rtp_t *rtp_ses
 	if (rtp_session) {
 		switch_mutex_lock(rtp_session->flag_mutex);
 		rtp_session->pmaps = pmap;
+		rtp_session->recv_pmap = NULL; /* the list changed; drop the cached lookup */
 		switch_mutex_unlock(rtp_session->flag_mutex);
 		return SWITCH_STATUS_SUCCESS;
 	}
@@ -5961,29 +5967,50 @@ static switch_size_t do_flush(switch_rtp_t *rtp_session, int force, switch_size_
 	return bytes_out;
 }
 
-static int check_recv_payload(switch_rtp_t *rtp_session)
+/* Return the negotiated payload map whose payload type matches the packet just read
+   (rtp_session->last_rtp_hdr.pt), or NULL if none. The result is cached: consecutive packets of
+   the same payload type -- the overwhelmingly common case, and the several checks made within one
+   packet -- hit the cache and skip both the flag_mutex and the list walk. The cached entry is
+   re-validated on every call (its fields are still consistent, it stays the right pt and remains
+   negotiated), so a renegotiation that rewrites the maps is picked up without explicit signalling.
+   Only positive matches are cached, so an unnegotiated payload type never poisons the cache. */
+static payload_map_t *find_recv_pmap(switch_rtp_t *rtp_session)
 {
-	int ok = 1;
+	switch_payload_t pt = rtp_session->last_rtp_hdr.pt;
+	payload_map_t *pmap, *match = NULL;
 
-	if (!(rtp_session->rtp_bugs & RTP_BUG_ACCEPT_ANY_PAYLOAD) && rtp_session->pmaps && *rtp_session->pmaps) {
-		payload_map_t *pmap;
-		ok = 0;
-
-		switch_mutex_lock(rtp_session->flag_mutex);
-
-		for (pmap = *rtp_session->pmaps; pmap && pmap->allocated; pmap = pmap->next) {
-			if (!pmap->negotiated) {
-				continue;
-			}
-
-			if (rtp_session->last_rtp_hdr.pt == pmap->pt) {
-				ok = 1;
-			}
-		}
-		switch_mutex_unlock(rtp_session->flag_mutex);
+	if (!(rtp_session->pmaps && *rtp_session->pmaps)) {
+		return NULL;
 	}
 
-	return ok;
+	pmap = rtp_session->recv_pmap;
+	if (pmap && rtp_session->recv_pmap_pt == pt && pmap->allocated && pmap->negotiated && pmap->pt == pt) {
+		return pmap;
+	}
+
+	switch_mutex_lock(rtp_session->flag_mutex);
+	for (pmap = *rtp_session->pmaps; pmap && pmap->allocated; pmap = pmap->next) {
+		if (pmap->negotiated && pmap->pt == pt) {
+			match = pmap;
+			break;
+		}
+	}
+	if (match) {
+		rtp_session->recv_pmap = match;
+		rtp_session->recv_pmap_pt = pt;
+	}
+	switch_mutex_unlock(rtp_session->flag_mutex);
+
+	return match;
+}
+
+static int check_recv_payload(switch_rtp_t *rtp_session)
+{
+	if ((rtp_session->rtp_bugs & RTP_BUG_ACCEPT_ANY_PAYLOAD) || !(rtp_session->pmaps && *rtp_session->pmaps)) {
+		return 1;
+	}
+
+	return find_recv_pmap(rtp_session) != NULL;
 }
 
 static int get_recv_payload(switch_rtp_t *rtp_session)
@@ -6513,27 +6540,15 @@ static switch_status_t read_rtp_packet(switch_rtp_t *rtp_session, switch_size_t 
 				int accept_packet = 1;
 
 
-				if (!(rtp_session->rtp_bugs & RTP_BUG_ACCEPT_ANY_PAYLOAD) && 
+				if (!(rtp_session->rtp_bugs & RTP_BUG_ACCEPT_ANY_PAYLOAD) &&
 					!(rtp_session->rtp_bugs & RTP_BUG_ACCEPT_ANY_PACKETS) && rtp_session->pmaps && *rtp_session->pmaps) {
-					payload_map_t *pmap;
-					accept_packet = 0;
+					payload_map_t *pmap = find_recv_pmap(rtp_session);
 
-					switch_mutex_lock(rtp_session->flag_mutex);
-					for (pmap = *rtp_session->pmaps; pmap && pmap->allocated; pmap = pmap->next) {
+					accept_packet = pmap ? 1 : 0;
 
-						if (!pmap->negotiated) {
-							continue;
-						}
-
-						if (rtp_session->last_rtp_hdr.pt == pmap->pt) {
-							accept_packet = 1;
-							if (pmapP) {
-								*pmapP = pmap;
-							}
-							break;
-						}
+					if (pmap && pmapP) {
+						*pmapP = pmap;
 					}
-					switch_mutex_unlock(rtp_session->flag_mutex);
 				}
 
 				if (!accept_packet) {
